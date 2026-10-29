@@ -8,6 +8,13 @@ computer, open the page, press **Enable MIDI**, and route any input to any outpu
   Each route can filter by input channel, remap to another channel, transpose, and pass or block
   notes, CC, program change, pitch bend, aftertouch, clock/sync and SysEx. Changing a route while
   notes are held never leaves them stuck.
+- **Mappings:** each connection can also turn one value into another, for example note velocity →
+  CC 74, CC 21 → CC 1, pitch bend → a CC, or velocity → velocity for a velocity curve. Press
+  **Learn** and move a control (or play a note) to pick the source. Each mapping has an input and
+  output range for scaling and inverting, and a live readout of the last value. Mapped messages go
+  out before the note they came from, so the synth has the value when the note starts. With
+  "Also send the original" off, the source message is replaced (on by default for note sources, so
+  the notes still play).
 - **Keyboard:** mouse, multi-touch or computer keys (`A`–`'`, sharps on `W E T Y U O P`,
   `Z`/`X` octave, `C`/`V` velocity), with channel, velocity, sustain, program change, pitch bend
   and mod wheel. Notes arriving from MIDI inputs light up on it.

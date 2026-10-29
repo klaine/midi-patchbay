@@ -8,6 +8,9 @@ root of `main`.
   localhost counts.
 - Routing: `transform()` applies a route's filters. Note-offs are matched to their note-on through
   `heldByRoute`, so channel or transpose changes never strand a note; keep that when changing it.
+- Mappings (`cfg.maps`, see `/* mappings */`) run after the route's channel filter and before its
+  type filters; their output is pushed ahead of the original message and ignores the type filters.
+  Values are in 0-127 (bend is scaled), and swapped range ends invert.
 - Route and keyboard settings persist in `localStorage` under `midi-patchbay:v1`, keyed by port
   name (port ids aren't stable across sessions). Wrap storage access in try/catch.
 - Without devices, test by replacing `navigator.requestMIDIAccess` with a mock that returns

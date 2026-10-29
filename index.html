@@ -190,10 +190,12 @@ main {
 /* routes */
 .routes { display: grid; gap: 8px; margin-top: 8px; }
 .route {
-  display: flex; flex-wrap: wrap; align-items: center; gap: 8px 14px;
+  display: grid; gap: 10px;
   padding: 10px 12px; border-radius: 10px; background: var(--surface-2);
 }
-.route .path { font-weight: 600; display: flex; align-items: center; gap: 6px; min-width: 0; flex: 1 1 220px; }
+.route-head { display: flex; align-items: center; gap: 12px; }
+.route-filters { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 14px; }
+.route .path { font-weight: 600; display: flex; align-items: center; gap: 6px; min-width: 0; flex: 1; }
 .route .path span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .route .path .arrow { color: var(--accent); flex: none; }
 .field { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); font-size: 12.5px; }
@@ -209,6 +211,45 @@ main {
 }
 .chip[aria-pressed="true"] { background: var(--text); border-color: var(--text); color: var(--surface); }
 .empty { color: var(--muted); font-size: 13px; padding: 8px 0; }
+
+/* mappings */
+.maps { display: grid; gap: 6px; border-top: 1px solid var(--line); padding-top: 10px; }
+.map {
+  position: relative; display: grid; gap: 6px; padding: 8px 40px 8px 10px; border-radius: 8px;
+  background: var(--surface); border: 1px solid var(--line);
+}
+.route, .maps, .map { grid-template-columns: minmax(0, 1fr); }
+.map .grp { display: inline-flex; flex-wrap: wrap; align-items: center; gap: 6px; white-space: nowrap; min-width: 0; }
+.map .icon.del { position: absolute; top: 6px; right: 6px; }
+.map select { max-width: min(150px, 100%); }
+.map-add .hint { white-space: normal; }
+.map.learning { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
+.map-io, .map-opts, .map-add, .rng { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.map-opts { gap: 6px 16px; font-size: 12.5px; color: var(--muted); }
+.map .word { color: var(--muted); font-size: 12.5px; }
+.map .arrow { color: var(--accent); }
+.map select, .map input.n {
+  min-height: 28px; border: 1px solid var(--line); border-radius: 6px;
+  background: var(--surface-2); padding: 0 6px; color: var(--text);
+}
+.map input.n { width: 56px; font-variant-numeric: tabular-nums; }
+.map .rng input.n { width: 52px; }
+.map .icon {
+  border: 0; background: none; color: var(--muted); cursor: pointer;
+  min-width: 28px; min-height: 28px; border-radius: 6px; font-size: 16px; line-height: 1;
+}
+.map .icon:hover { color: var(--text); background: var(--surface-2); }
+.learn[aria-pressed="true"] { animation: pulse 1s ease-in-out infinite; }
+@keyframes pulse { 50% { opacity: .55; } }
+.val { display: inline-flex; align-items: center; gap: 8px; font: 12px var(--mono); }
+.vbar { display: block; width: 64px; height: 6px; border-radius: 3px; background: var(--surface-2); overflow: hidden; }
+.vbar b { display: block; height: 100%; width: 0; background: var(--muted); }
+.val.live .vbar b { background: var(--accent); }
+.map-add .hint { font-size: 12.5px; }
+.cell.mapped::before {
+  content: ""; position: absolute; top: 3px; right: 3px; width: 6px; height: 6px;
+  border-radius: 50%; background: var(--in); box-shadow: 0 0 0 1.5px var(--surface);
+}
 
 /* keyboard */
 .kb-controls { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 18px; margin-bottom: 14px; }
@@ -286,6 +327,11 @@ footer a { color: inherit; }
 
 @media (max-width: 640px) {
   .top { padding: 10px 16px; }
+  .card { padding: 12px; }
+  .route { padding: 8px; }
+  .map { padding: 8px 34px 8px 8px; }
+  .map select { max-width: min(116px, 100%); }
+  .map input.n, .map .rng input.n { width: 46px; }
   .keys { height: 150px; }
   .wheel input { height: 120px; }
   .log .row { grid-template-columns: 76px 90px 100px 30px 130px 80px; }
@@ -419,7 +465,7 @@ const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&
 const routeKey = (src, dst) => src + '→' + dst;
 
 function defaultRoute(dst) {
-  return { on: dst === MON, chIn: 0, chOut: 0, tr: 0, notes: true, cc: true, prog: true, bend: true, at: true, sync: dst !== MON, sysex: true };
+  return { on: dst === MON, chIn: 0, chOut: 0, tr: 0, notes: true, cc: true, prog: true, bend: true, at: true, sync: dst !== MON, sysex: true, maps: [] };
 }
 function getRoute(src, dst) {
   const r = state.routes[routeKey(src, dst)];
@@ -562,26 +608,33 @@ function rebuildRouting() {
     if (list.length) next.set(src, list);
   }
   routing = next;
+  for (const b of document.querySelectorAll('.matrix .cell')) {
+    b.classList.toggle('mapped', getRoute(b.dataset.src, b.dataset.dst).maps.length > 0);
+  }
   renderRoutes();
 }
 
+const outBuf = [];
 function dispatch(src, data) {
   flash('s:' + src);
+  if (learning && learning.src === src) learnFrom(data);
   const list = routing.get(src);
   if (!list) return;
   for (const r of list) {
-    const out = transform(data, r);
-    if (out) deliver(r.dst, out, src);
+    outBuf.length = 0;
+    transform(data, r, outBuf);
+    for (const m of outBuf) deliver(r.dst, m, src);
   }
 }
 
-// Applies one route's filters to a message. Note-offs follow the note-on they
-// belong to, so changing channel or transpose while a note sounds never strands it.
-function transform(d, r) {
+// Applies one route's filters and mappings to a message, pushing the results to
+// `out`. Note-offs follow the note-on they belong to, so changing channel or
+// transpose while a note sounds never strands it.
+function transform(d, r, out) {
   const c = r.cfg;
   const st = d[0];
-  if (st === 0xF0) return c.sysex ? d : null;
-  if (st > 0xF0) return c.sync ? d : null;
+  if (st === 0xF0) { if (c.sysex) out.push(d); return; }
+  if (st > 0xF0) { if (c.sync) out.push(d); return; }
   const type = st & 0xF0;
   const ch = st & 0x0F;
   if (type === 0x80 || (type === 0x90 && d[2] === 0)) {
@@ -589,31 +642,155 @@ function transform(d, r) {
     const m = r.held.get(hk);
     if (m !== undefined) {
       r.held.delete(hk);
-      return [type | (m >> 7), m & 127, d[2]];
+      out.push([type | (m >> 7), m & 127, d[2]]);
+      return;
     }
   }
-  if (c.chIn && ch !== c.chIn - 1) return null;
+  if (c.chIn && ch !== c.chIn - 1) return;
   const oc = c.chOut ? c.chOut - 1 : ch;
+
+  // Mappings go first, so a synth has the mapped value before the note starts.
+  let vel = d[2];
+  let pass = true;
+  for (let i = 0; i < c.maps.length; i++) {
+    const m = c.maps[i];
+    const src = mapSource(m, type, d);
+    if (src < 0) continue;
+    const v = scaleMap(m, src);
+    noteMapActivity(r.rk, i, src, v);
+    if (m.dst === 'vel') { vel = Math.max(1, Math.round(v)); continue; }
+    out.push(mapMessage(m, v, oc));
+    if (!m.keep) pass = false;
+  }
+  if (!pass) return;
+
   switch (type) {
     case 0x80:
     case 0x90: {
-      if (!c.notes) return null;
+      if (!c.notes) return;
       const n = d[1] + c.tr;
-      if (n < 0 || n > 127) return null;
+      if (n < 0 || n > 127) return;
       if (type === 0x90 && d[2] > 0) r.held.set((ch << 7) | d[1], (oc << 7) | n);
-      return [type | oc, n, d[2]];
+      out.push([type | oc, n, type === 0x90 && d[2] > 0 ? vel : d[2]]);
+      return;
     }
     case 0xA0: {
-      if (!c.at) return null;
+      if (!c.at) return;
       const n = d[1] + c.tr;
-      return n < 0 || n > 127 ? null : [0xA0 | oc, n, d[2]];
+      if (n >= 0 && n <= 127) out.push([0xA0 | oc, n, d[2]]);
+      return;
     }
-    case 0xB0: return c.cc ? [0xB0 | oc, d[1], d[2]] : null;
-    case 0xC0: return c.prog ? [0xC0 | oc, d[1]] : null;
-    case 0xD0: return c.at ? [0xD0 | oc, d[1]] : null;
-    case 0xE0: return c.bend ? [0xE0 | oc, d[1], d[2]] : null;
+    case 0xB0: if (c.cc) out.push([0xB0 | oc, d[1], d[2]]); return;
+    case 0xC0: if (c.prog) out.push([0xC0 | oc, d[1]]); return;
+    case 0xD0: if (c.at) out.push([0xD0 | oc, d[1]]); return;
+    case 0xE0: if (c.bend) out.push([0xE0 | oc, d[1], d[2]]); return;
   }
-  return null;
+}
+
+/* ---------- mappings ---------- */
+
+// A mapping turns one value of an incoming message into another message, e.g.
+// note velocity -> CC 74, or CC 21 -> CC 1. Values are scaled through an input
+// range and an output range, both in 0-127 (14-bit pitch bend is scaled to fit).
+const MAP_SOURCES = [
+  ['vel', 'Note velocity'], ['note', 'Note number'], ['cc', 'CC'], ['bend', 'Pitch bend'],
+  ['at', 'Channel pressure'], ['pat', 'Poly aftertouch'], ['prog', 'Program change'],
+];
+const MAP_DESTS = [
+  ['cc', 'CC'], ['vel', 'Note velocity'], ['bend', 'Pitch bend'], ['at', 'Channel pressure'], ['prog', 'Program change'],
+];
+const NOTE_SOURCES = new Set(['vel', 'note']);
+
+function newMap(src = 'cc') {
+  return { src, srcCC: 1, dst: 'cc', dstCC: 74, inLo: 0, inHi: 127, outLo: 0, outHi: 127, keep: NOTE_SOURCES.has(src) };
+}
+
+// The source value of a message for a mapping, in 0-127, or -1 when it doesn't apply.
+function mapSource(m, type, d) {
+  switch (m.src) {
+    case 'vel': return type === 0x90 && d[2] > 0 ? d[2] : -1;
+    case 'note': return type === 0x90 && d[2] > 0 ? d[1] : -1;
+    case 'cc': return type === 0xB0 && d[1] === m.srcCC ? d[2] : -1;
+    case 'bend': return type === 0xE0 ? ((d[2] << 7) | d[1]) * 127 / 16383 : -1;
+    case 'at': return type === 0xD0 ? d[1] : -1;
+    case 'pat': return type === 0xA0 ? d[2] : -1;
+    case 'prog': return type === 0xC0 ? d[1] : -1;
+  }
+  return -1;
+}
+
+// Swapped ends of either range invert the response.
+function scaleMap(m, x) {
+  let t = m.inHi === m.inLo ? (x >= m.inHi ? 1 : 0) : (x - m.inLo) / (m.inHi - m.inLo);
+  t = Math.max(0, Math.min(1, t));
+  return m.outLo + t * (m.outHi - m.outLo);
+}
+
+function mapMessage(m, v, oc) {
+  const b = Math.round(v);
+  switch (m.dst) {
+    case 'cc': return [0xB0 | oc, m.dstCC, b];
+    case 'at': return [0xD0 | oc, b];
+    case 'prog': return [0xC0 | oc, b];
+    case 'bend': {
+      const w = Math.round(v / 127 * 16383);
+      return [0xE0 | oc, w & 127, w >> 7];
+    }
+  }
+}
+
+// Live readout: the latest in -> out values of each mapping, drawn once a frame.
+const mapActivity = new Map();
+let mapRaf = 0;
+function noteMapActivity(rk, i, x, v) {
+  mapActivity.set(rk + '#' + i, [x, v]);
+  if (!mapRaf) mapRaf = requestAnimationFrame(drawMapActivity);
+}
+function drawMapActivity() {
+  mapRaf = 0;
+  for (const [key, [x, v]] of mapActivity) {
+    const el = mapValEls.get(key);
+    if (!el) continue;
+    el.classList.add('live');
+    el.querySelector('b').style.width = (v / 127 * 100).toFixed(1) + '%';
+    el.querySelector('.vtxt').textContent = `${Math.round(x)} → ${Math.round(v)}`;
+  }
+  mapActivity.clear();
+}
+
+// MIDI learn: the next suitable message from the route's source sets the mapping's source.
+let learning = null; // {src, dst, i}
+function learnFrom(d) {
+  const type = d[0] & 0xF0;
+  let src = null, srcCC;
+  if (type === 0xB0) { src = 'cc'; srcCC = d[1]; }
+  else if (type === 0x90 && d[2] > 0) src = 'vel';
+  else if (type === 0xE0) src = 'bend';
+  else if (type === 0xD0) src = 'at';
+  else if (type === 0xA0) src = 'pat';
+  else if (type === 0xC0) src = 'prog';
+  if (!src) return;
+  const { dst, i } = learning;
+  const s = learning.src;
+  learning = null;
+  updateMap(s, dst, i, (m) => {
+    m.src = src;
+    if (srcCC !== undefined) m.srcCC = srcCC;
+    m.keep = NOTE_SOURCES.has(src);
+    if (m.dst === 'vel' && src !== 'vel') m.dst = 'cc';
+  });
+}
+
+function updateMap(src, dst, i, fn) {
+  const cfg = getRoute(src, dst);
+  const maps = cfg.maps.map((m) => ({ ...m }));
+  if (i === -1) maps.push(fn());
+  else if (!maps[i]) return;
+  else if (fn === null) maps.splice(i, 1);
+  else fn(maps[i]);
+  state.routes[routeKey(src, dst)] = { ...cfg, maps };
+  save();
+  rebuildRouting();
 }
 
 function deliver(dst, data, src) {
@@ -699,9 +876,9 @@ function renderMatrix() {
   for (const s of sources.values()) {
     h += `<tr><th title="${esc(s.name)}"><span class="rname"><span class="led" data-led="${esc('s:' + s.key)}"></span>${esc(s.name)}${s.kind === 'kb' ? ' <span class="kind">(virtual)</span>' : ''}</span></th>`;
     for (const d of dests.values()) {
-      const on = getRoute(s.key, d.key).on;
+      const { on, maps } = getRoute(s.key, d.key);
       const risk = loopRisk(s.key, d.key);
-      h += `<td><button class="cell${risk ? ' warn' : ''}" data-src="${esc(s.key)}" data-dst="${esc(d.key)}" aria-pressed="${on}" title="${esc(s.name)} → ${esc(d.name)}${risk ? ' (same device: may feed back)' : ''}" aria-label="Route ${esc(s.name)} to ${esc(d.name)}"></button></td>`;
+      h += `<td><button class="cell${risk ? ' warn' : ''}${maps.length ? ' mapped' : ''}" data-src="${esc(s.key)}" data-dst="${esc(d.key)}" aria-pressed="${on}" title="${esc(s.name)} → ${esc(d.name)}${risk ? ' (same device: may feed back)' : ''}" aria-label="Route ${esc(s.name)} to ${esc(d.name)}"></button></td>`;
     }
     h += '</tr>';
   }
@@ -741,6 +918,47 @@ function chOptions(sel, zeroLabel) {
   return h;
 }
 
+const mapValEls = new Map(); // "rk#i" -> readout element
+
+function options(list, sel, allowed = () => true) {
+  return list.filter(([k]) => allowed(k)).map(([k, l]) => `<option value="${k}"${k === sel ? ' selected' : ''}>${l}</option>`).join('');
+}
+function num(f, v, label, min = 0, max = 127) {
+  return `<input type="number" class="n" data-m="${f}" min="${min}" max="${max}" value="${v}" aria-label="${label}">`;
+}
+
+function renderMap(m, i, s, learnOn) {
+  const srcName = s.kind === 'kb' ? 'the keyboard' : s.name;
+  return `<div class="map${learnOn ? ' learning' : ''}" data-i="${i}">
+    <button class="icon del" data-m="del" aria-label="Remove mapping" title="Remove mapping">×</button>
+    <div class="map-io">
+      <span class="grp">
+        <span class="word">When</span>
+        <select data-m="src" aria-label="Source">${options(MAP_SOURCES, m.src)}</select>
+        ${m.src === 'cc' ? num('srcCC', m.srcCC, 'Source CC number') : ''}
+        <button class="btn sm learn" data-m="learn" aria-pressed="${learnOn}" title="Then move a control or play a note on ${esc(srcName)}">${learnOn ? 'Listening…' : 'Learn'}</button>
+      </span>
+      <span class="grp">
+        <span class="arrow">→</span>
+        <span class="word">send</span>
+        <select data-m="dst" aria-label="Destination">${options(MAP_DESTS, m.dst, (k) => k !== 'vel' || m.src === 'vel')}</select>
+        ${m.dst === 'cc' ? num('dstCC', m.dstCC, 'Destination CC number') : ''}
+      </span>
+    </div>
+    <div class="map-opts">
+      <span class="rng" title="Input values from min to max become output values from min to max. Swap the ends to invert.">
+        <span class="grp"><span class="word">Range</span>
+          ${num('inLo', m.inLo, 'Input minimum')}–${num('inHi', m.inHi, 'Input maximum')}</span>
+        <span class="grp"><span class="arrow">→</span>
+          ${num('outLo', m.outLo, 'Output minimum')}–${num('outHi', m.outHi, 'Output maximum')}
+          <button class="icon" data-m="invert" aria-label="Invert output" title="Invert output">⇅</button></span>
+      </span>
+      ${m.dst === 'vel' ? '' : `<label class="toggle"><input type="checkbox" data-m="keep"${m.keep ? ' checked' : ''}> Also send the original ${NOTE_SOURCES.has(m.src) ? 'note' : 'message'}</label>`}
+      <span class="val" title="Last value in → out"><i class="vbar"><b></b></i><span class="vtxt">${learnOn ? `Move a control on ${esc(srcName)}` : '—'}</span></span>
+    </div>
+  </div>`;
+}
+
 function renderRoutes() {
   const box = $('#routes');
   if (box.contains(document.activeElement) && document.activeElement.matches('input[type="number"]')) return;
@@ -749,18 +967,34 @@ function renderRoutes() {
     for (const d of dests.values()) {
       const c = getRoute(s.key, d.key);
       if (!c.on) continue;
-      const rk = esc(routeKey(s.key, d.key));
+      const isLearning = (i) => learning && learning.src === s.key && learning.dst === d.key && learning.i === i;
       h += `<div class="route" data-src="${esc(s.key)}" data-dst="${esc(d.key)}">
-        <div class="path"><span>${esc(s.name)}</span><span class="arrow">→</span><span>${esc(d.name)}</span></div>
-        <label class="field">Ch in <select data-f="chIn">${chOptions(c.chIn, 'Any')}</select></label>
-        <label class="field">Ch out <select data-f="chOut">${chOptions(c.chOut, 'Same')}</select></label>
-        <label class="field">Transpose <input type="number" data-f="tr" min="-48" max="48" step="1" value="${c.tr}"></label>
-        <div class="chips">${TYPES.map(([k, l]) => `<button class="chip" data-f="${k}" aria-pressed="${!!c[k]}">${l}</button>`).join('')}</div>
-        <button class="btn sm" data-f="off" aria-label="Disconnect">Disconnect</button>
+        <div class="route-head">
+          <div class="path"><span>${esc(s.name)}</span><span class="arrow">→</span><span>${esc(d.name)}</span></div>
+          <button class="btn sm" data-f="off">Disconnect</button>
+        </div>
+        <div class="route-filters">
+          <label class="field">Ch in <select data-f="chIn">${chOptions(c.chIn, 'Any')}</select></label>
+          <label class="field">Ch out <select data-f="chOut">${chOptions(c.chOut, 'Same')}</select></label>
+          <label class="field">Transpose <input type="number" data-f="tr" min="-48" max="48" step="1" value="${c.tr}"></label>
+          <div class="chips">${TYPES.map(([k, l]) => `<button class="chip" data-f="${k}" aria-pressed="${!!c[k]}">${l}</button>`).join('')}</div>
+        </div>
+        <div class="maps">
+          ${c.maps.map((m, i) => renderMap(m, i, s, isLearning(i))).join('')}
+          <div class="map-add">
+            <button class="btn sm" data-m="add">+ Add mapping</button>
+            ${c.maps.length ? '' : '<span class="hint">Turn one value into another: velocity → CC, one CC into another, aftertouch → pitch bend…</span>'}
+          </div>
+        </div>
       </div>`;
     }
   }
   box.innerHTML = h || '<div class="empty">Nothing is connected yet. Click a square in the grid above.</div>';
+  mapValEls.clear();
+  for (const r of box.querySelectorAll('.route')) {
+    const rk = routeKey(r.dataset.src, r.dataset.dst);
+    for (const m of r.querySelectorAll('.map')) mapValEls.set(rk + '#' + m.dataset.i, m.querySelector('.val'));
+  }
 }
 
 function routeOf(el) {
@@ -768,6 +1002,8 @@ function routeOf(el) {
   return r && [r.dataset.src, r.dataset.dst];
 }
 $('#routes').addEventListener('click', (e) => {
+  const mb = e.target.closest('button[data-m]');
+  if (mb) return onMapButton(mb);
   const b = e.target.closest('button[data-f]');
   if (!b) return;
   const [src, dst] = routeOf(b);
@@ -779,7 +1015,49 @@ $('#routes').addEventListener('click', (e) => {
   }
   setRoute(src, dst, { [f]: b.getAttribute('aria-pressed') !== 'true' });
 });
+function onMapButton(b) {
+  const [src, dst] = routeOf(b);
+  const mapEl = b.closest('.map');
+  const i = mapEl ? +mapEl.dataset.i : -1;
+  switch (b.dataset.m) {
+    case 'add':
+      // A new mapping starts listening, so the quickest path is: add, then touch a control.
+      updateMap(src, dst, -1, () => newMap());
+      learning = { src, dst, i: getRoute(src, dst).maps.length - 1 };
+      renderRoutes();
+      break;
+    case 'learn':
+      learning = b.getAttribute('aria-pressed') === 'true' ? null : { src, dst, i };
+      renderRoutes();
+      break;
+    case 'del':
+      if (learning && learning.src === src && learning.dst === dst) learning = null;
+      updateMap(src, dst, i, null);
+      break;
+    case 'invert':
+      updateMap(src, dst, i, (m) => { [m.outLo, m.outHi] = [m.outHi, m.outLo]; });
+      break;
+  }
+}
+
 $('#routes').addEventListener('change', (e) => {
+  const me = e.target.closest('[data-m]');
+  if (me && me.tagName !== 'BUTTON') {
+    const [src, dst] = routeOf(me);
+    const i = +me.closest('.map').dataset.i;
+    const f = me.dataset.m;
+    if (learning && learning.src === src && learning.dst === dst && learning.i === i && f === 'src') learning = null;
+    updateMap(src, dst, i, (m) => {
+      if (f === 'keep') m.keep = me.checked;
+      else if (f === 'src') {
+        m.src = me.value;
+        m.keep = NOTE_SOURCES.has(m.src);
+        if (m.dst === 'vel' && m.src !== 'vel') m.dst = 'cc';
+      } else if (f === 'dst') m.dst = me.value;
+      else m[f] = Math.max(0, Math.min(127, parseInt(me.value, 10) || 0));
+    });
+    return;
+  }
   const el = e.target.closest('[data-f]');
   if (!el || el.tagName === 'BUTTON') return;
   const [src, dst] = routeOf(el);
@@ -1030,6 +1308,9 @@ window.addEventListener('keydown', (e) => {
   else if (e.code === 'KeyX') shiftOctave(1);
   else if (e.code === 'KeyC') setVelocity(state.kb.vel - 10);
   else if (e.code === 'KeyV') setVelocity(state.kb.vel + 10);
+});
+window.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape' && learning) { learning = null; renderRoutes(); }
 });
 window.addEventListener('keyup', (e) => {
   const n = pressedCodes.get(e.code);
