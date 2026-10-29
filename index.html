@@ -1,0 +1,1130 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MIDI Patchbay</title>
+<meta name="description" content="Browser MIDI keyboard, patch bay and monitor. Routes MIDI between connected devices with channel, transpose and message filters. Runs entirely client side.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ccircle cx='16' cy='16' r='14' fill='%23e8590c'/%3E%3Cg fill='%23fff'%3E%3Ccircle cx='9' cy='15' r='2.2'/%3E%3Ccircle cx='23' cy='15' r='2.2'/%3E%3Ccircle cx='11.5' cy='21' r='2.2'/%3E%3Ccircle cx='20.5' cy='21' r='2.2'/%3E%3Ccircle cx='16' cy='23.5' r='2.2'/%3E%3C/g%3E%3Crect x='13' y='5' width='6' height='3' rx='1' fill='%23fff'/%3E%3C/svg%3E">
+<style>
+:root {
+  --bg: #f4f2ee;
+  --surface: #ffffff;
+  --surface-2: #f0ede8;
+  --text: #1c1b19;
+  --muted: #6b675f;
+  --line: #e2ddd5;
+  --accent: #e8590c;
+  --accent-soft: #fde3d3;
+  --accent-ink: #ffffff;
+  --in: #3b5bdb;
+  --in-soft: #dbe4ff;
+  --warn: #c76a00;
+  --danger: #c92a2a;
+  --key-white: #ffffff;
+  --key-black: #1f1e1c;
+  --shadow: 0 1px 2px rgb(0 0 0 / .06), 0 4px 16px rgb(0 0 0 / .04);
+  --radius: 12px;
+  --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  color-scheme: light;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #111112;
+    --surface: #1a1a1c;
+    --surface-2: #232326;
+    --text: #ecebe8;
+    --muted: #9a968e;
+    --line: #2f2f33;
+    --accent: #ff7a2e;
+    --accent-soft: #3d2416;
+    --accent-ink: #1a0d05;
+    --in: #7c95ff;
+    --in-soft: #1f2747;
+    --warn: #f5a623;
+    --danger: #ff6b6b;
+    --key-white: #e9e7e2;
+    --key-black: #0c0c0d;
+    --shadow: none;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #111112;
+  --surface: #1a1a1c;
+  --surface-2: #232326;
+  --text: #ecebe8;
+  --muted: #9a968e;
+  --line: #2f2f33;
+  --accent: #ff7a2e;
+  --accent-soft: #3d2416;
+  --accent-ink: #1a0d05;
+  --in: #7c95ff;
+  --in-soft: #1f2747;
+  --warn: #f5a623;
+  --danger: #ff6b6b;
+  --key-white: #e9e7e2;
+  --key-black: #0c0c0d;
+  --shadow: none;
+  color-scheme: dark;
+}
+
+* { box-sizing: border-box; }
+[hidden] { display: none !important; }
+html { -webkit-text-size-adjust: 100%; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font: 14px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+button, input, select { font: inherit; color: inherit; }
+h1, h2, h3 { margin: 0; font-weight: 650; letter-spacing: -.01em; }
+h1 { font-size: 18px; }
+h2 { font-size: 15px; }
+h3 { font-size: 13px; color: var(--muted); font-weight: 600; text-transform: uppercase; letter-spacing: .06em; }
+.hint { color: var(--muted); margin: 0; font-size: 13px; }
+kbd {
+  font: 12px var(--mono);
+  padding: 1px 5px;
+  border: 1px solid var(--line);
+  border-bottom-width: 2px;
+  border-radius: 4px;
+  background: var(--surface);
+}
+
+/* top bar */
+.top {
+  position: sticky; top: 0; z-index: 10;
+  display: flex; flex-wrap: wrap; align-items: center; gap: 10px 16px;
+  padding: 12px max(16px, calc((100% - 1200px) / 2));
+  background: color-mix(in srgb, var(--bg) 88%, transparent);
+  backdrop-filter: blur(10px);
+  border-bottom: 1px solid var(--line);
+}
+.brand { display: flex; align-items: center; gap: 10px; margin-right: auto; }
+.brand svg { width: 26px; height: 26px; flex: none; }
+.status {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 3px 10px; border-radius: 999px;
+  background: var(--surface-2); color: var(--muted); font-size: 12.5px;
+  white-space: nowrap;
+}
+.status::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: currentColor; opacity: .6; }
+.status.ok { color: var(--text); }
+.status.ok::before { background: #2f9e44; opacity: 1; }
+.status.err { color: var(--danger); }
+.actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+
+.btn {
+  display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+  min-height: 32px; padding: 0 12px;
+  border: 1px solid var(--line); border-radius: 8px;
+  background: var(--surface); cursor: pointer; white-space: nowrap;
+}
+.btn:hover { border-color: color-mix(in srgb, var(--text) 30%, var(--line)); }
+.btn:focus-visible, .cell:focus-visible, .chip:focus-visible, .key:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.btn.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); font-weight: 600; }
+.btn.danger { color: var(--danger); }
+.btn[aria-pressed="true"] { background: var(--accent-soft); border-color: var(--accent); color: var(--text); }
+.btn.sm { min-height: 26px; padding: 0 8px; font-size: 12.5px; }
+.toggle { display: inline-flex; align-items: center; gap: 6px; cursor: pointer; user-select: none; color: var(--muted); }
+.toggle input { accent-color: var(--accent); width: 15px; height: 15px; margin: 0; }
+
+main {
+  max-width: 1200px; margin: 0 auto; padding: 16px;
+  display: grid; gap: 16px;
+}
+.card {
+  background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius);
+  box-shadow: var(--shadow); padding: 16px; min-width: 0;
+}
+.card-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 12px; margin-bottom: 12px; }
+.card-head .spacer { flex: 1; }
+.notice {
+  border: 1px solid color-mix(in srgb, var(--warn) 50%, var(--line));
+  background: color-mix(in srgb, var(--warn) 10%, var(--surface));
+  border-radius: var(--radius); padding: 12px 16px;
+}
+.notice p { margin: 0; }
+
+/* patch bay matrix */
+.matrix-wrap { overflow-x: auto; margin: 0 -4px; padding: 0 4px 4px; }
+.matrix { border-collapse: separate; border-spacing: 0; }
+.matrix th { font-weight: 500; text-align: left; }
+.matrix thead th.col {
+  vertical-align: bottom; padding: 0 0 8px; width: 40px; min-width: 40px;
+}
+.matrix thead th.col .vname {
+  writing-mode: vertical-rl; transform: rotate(180deg);
+  display: inline-flex; align-items: center; gap: 6px;
+  max-height: 170px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  margin: 0 auto; display: flex;
+}
+.matrix thead th.corner { vertical-align: bottom; padding: 0 12px 8px 0; color: var(--muted); font-size: 12px; }
+.matrix tbody th {
+  padding: 0 12px 0 0; white-space: nowrap; max-width: 260px;
+  overflow: hidden; text-overflow: ellipsis; height: 40px;
+}
+.matrix tbody th .rname { display: inline-flex; align-items: center; gap: 8px; }
+.matrix td { padding: 0; width: 40px; height: 40px; text-align: center; }
+.matrix tr:hover th, .matrix th.hl { color: var(--accent); }
+.kind { font-size: 11px; color: var(--muted); font-weight: 400; }
+.cell {
+  width: 32px; height: 32px; padding: 0; border-radius: 8px;
+  border: 1px dashed var(--line); background: transparent; cursor: pointer;
+  display: inline-grid; place-items: center; position: relative;
+}
+.cell:hover { border-style: solid; border-color: var(--accent); background: var(--accent-soft); }
+.cell.xhl { background: color-mix(in srgb, var(--accent-soft) 45%, transparent); }
+.cell[aria-pressed="true"] { border: 1px solid var(--accent); background: var(--accent); }
+.cell[aria-pressed="true"]::after { content: ""; width: 10px; height: 10px; border-radius: 50%; background: var(--accent-ink); }
+.cell.warn:not([aria-pressed="true"]) { border-color: color-mix(in srgb, var(--warn) 55%, var(--line)); }
+.cell.warn[aria-pressed="true"] { background: var(--warn); border-color: var(--warn); }
+.led {
+  width: 8px; height: 8px; border-radius: 50%; flex: none;
+  background: var(--line); transition: background .25s, box-shadow .25s;
+}
+.led.on { background: #40c057; box-shadow: 0 0 6px #40c057; transition: none; }
+
+/* routes */
+.routes { display: grid; gap: 8px; margin-top: 8px; }
+.route {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 8px 14px;
+  padding: 10px 12px; border-radius: 10px; background: var(--surface-2);
+}
+.route .path { font-weight: 600; display: flex; align-items: center; gap: 6px; min-width: 0; flex: 1 1 220px; }
+.route .path span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.route .path .arrow { color: var(--accent); flex: none; }
+.field { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); font-size: 12.5px; }
+.field select, .field input {
+  min-height: 28px; border: 1px solid var(--line); border-radius: 6px;
+  background: var(--surface); padding: 0 6px; color: var(--text);
+}
+.field input[type="number"] { width: 64px; }
+.chips { display: flex; flex-wrap: wrap; gap: 4px; }
+.chip {
+  border: 1px solid var(--line); background: var(--surface); color: var(--muted);
+  border-radius: 999px; padding: 2px 9px; font-size: 12px; cursor: pointer;
+}
+.chip[aria-pressed="true"] { background: var(--text); border-color: var(--text); color: var(--surface); }
+.empty { color: var(--muted); font-size: 13px; padding: 8px 0; }
+
+/* keyboard */
+.kb-controls { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 18px; margin-bottom: 14px; }
+.group { display: inline-flex; align-items: center; gap: 6px; }
+.group > .lbl { color: var(--muted); font-size: 12.5px; }
+.readout { font: 600 13px var(--mono); min-width: 2.6em; text-align: center; }
+input[type="range"] { accent-color: var(--accent); }
+.kb-row { display: flex; gap: 12px; align-items: stretch; }
+.wheels { display: flex; gap: 10px; }
+.wheel { display: flex; flex-direction: column; align-items: center; gap: 4px; color: var(--muted); font-size: 11px; }
+.wheel input {
+  writing-mode: vertical-lr; direction: rtl;
+  width: 28px; height: 150px; margin: 0;
+}
+.keys {
+  position: relative; flex: 1; min-width: 0; height: 180px;
+  display: flex; user-select: none; -webkit-user-select: none; touch-action: none;
+}
+.key { position: relative; cursor: pointer; touch-action: none; }
+.key.white {
+  flex: 1; background: var(--key-white);
+  border: 1px solid var(--line); border-right-width: 0;
+  border-radius: 0 0 6px 6px;
+  box-shadow: inset 0 -6px 0 rgb(0 0 0 / .06);
+}
+.key.white:last-child { border-right-width: 1px; }
+.key.black {
+  position: absolute; top: 0; height: 60%; z-index: 2;
+  background: var(--key-black); border-radius: 0 0 5px 5px;
+  box-shadow: inset 0 -5px 0 rgb(255 255 255 / .08), 0 2px 3px rgb(0 0 0 / .25);
+}
+.key.in.white { background: var(--in-soft); }
+.key.in.black { background: var(--in); }
+.key.down.white, .key.down.black { background: var(--accent); }
+.key.off { opacity: .35; pointer-events: none; }
+.key .lab {
+  position: absolute; left: 0; right: 0; bottom: 8px; text-align: center;
+  font: 11px var(--mono); color: var(--muted); pointer-events: none;
+}
+.key.black .lab { color: #8b877f; bottom: 6px; }
+.key .ck { display: block; font-size: 10px; opacity: .7; text-transform: uppercase; }
+.key.down .lab { color: var(--accent-ink); }
+
+/* monitor */
+.log {
+  font: 12px/1.6 var(--mono);
+  background: var(--surface-2); border-radius: 10px;
+  height: 280px; overflow: auto; padding: 6px 0;
+}
+.log .row {
+  display: grid; grid-template-columns: 92px minmax(90px, 1.2fr) minmax(110px, 1fr) 40px minmax(120px, 1.3fr) minmax(80px, .8fr);
+  gap: 10px; padding: 0 12px; white-space: nowrap;
+}
+.log .row > span { overflow: hidden; text-overflow: ellipsis; }
+.log .row.head { color: var(--muted); position: sticky; top: -6px; background: var(--surface-2); padding-top: 2px; }
+.log .t, .log .hex { color: var(--muted); }
+.log .ty-note { color: var(--accent); }
+.log .ty-cc { color: var(--in); }
+.log .ty-sys { color: var(--warn); }
+.count { color: var(--muted); font-size: 12.5px; font-variant-numeric: tabular-nums; }
+
+footer {
+  max-width: 1200px; margin: 0 auto; padding: 8px 16px 32px;
+  color: var(--muted); font-size: 12.5px;
+}
+footer a { color: inherit; }
+
+.toast {
+  position: fixed; left: 50%; bottom: 20px; transform: translateX(-50%) translateY(20px);
+  max-width: calc(100% - 32px);
+  background: var(--text); color: var(--surface); padding: 10px 14px; border-radius: 10px;
+  font-size: 13px; opacity: 0; pointer-events: none; transition: opacity .2s, transform .2s; z-index: 20;
+}
+.toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+
+@media (max-width: 640px) {
+  .top { padding: 10px 16px; }
+  .keys { height: 150px; }
+  .wheel input { height: 120px; }
+  .log .row { grid-template-columns: 76px 90px 100px 30px 130px 80px; }
+}
+</style>
+</head>
+<body>
+<header class="top">
+  <div class="brand">
+    <svg viewBox="0 0 32 32" aria-hidden="true"><circle cx="16" cy="16" r="14" fill="var(--accent)"/><g fill="var(--accent-ink)"><circle cx="9" cy="15" r="2.2"/><circle cx="23" cy="15" r="2.2"/><circle cx="11.5" cy="21" r="2.2"/><circle cx="20.5" cy="21" r="2.2"/><circle cx="16" cy="23.5" r="2.2"/><rect x="13" y="5" width="6" height="3" rx="1"/></g></svg>
+    <h1>MIDI Patchbay</h1>
+  </div>
+  <span class="status" id="status">MIDI off</span>
+  <div class="actions">
+    <button class="btn primary" id="enable">Enable MIDI</button>
+    <label class="toggle" title="System exclusive messages need an extra browser permission"><input type="checkbox" id="sysex"> SysEx</label>
+    <button class="btn danger" id="panic" title="Release held notes and send All Notes Off on every output">Panic</button>
+  </div>
+</header>
+
+<main>
+  <div class="notice" id="notice" hidden><p id="notice-text"></p></div>
+
+  <section class="card" aria-labelledby="bay-h">
+    <div class="card-head">
+      <h2 id="bay-h">Patch bay</h2>
+      <p class="hint">Rows send, columns receive. Click a square to connect them.</p>
+    </div>
+    <div class="matrix-wrap"><table class="matrix" id="matrix"></table></div>
+    <h3 style="margin-top:16px">Routes</h3>
+    <div class="routes" id="routes"></div>
+  </section>
+
+  <section class="card" aria-labelledby="kb-h">
+    <div class="card-head">
+      <h2 id="kb-h">Keyboard</h2>
+      <p class="hint">Plays into the patch bay as “On-screen keyboard”.</p>
+    </div>
+    <div class="kb-controls">
+      <label class="group"><span class="lbl">Channel</span>
+        <span class="field"><select id="kb-ch"></select></span></label>
+      <div class="group"><span class="lbl">Octave</span>
+        <button class="btn sm" id="oct-down" aria-label="Octave down">−</button>
+        <span class="readout" id="oct">C4</span>
+        <button class="btn sm" id="oct-up" aria-label="Octave up">+</button></div>
+      <label class="group"><span class="lbl">Velocity</span>
+        <input type="range" id="vel" min="1" max="127">
+        <span class="readout" id="vel-out">100</span></label>
+      <button class="btn sm" id="sustain" aria-pressed="false" title="CC 64">Sustain</button>
+      <div class="group"><span class="lbl">Program</span>
+        <span class="field"><input type="number" id="prog" min="1" max="128" value="1" aria-label="Program number"></span>
+        <button class="btn sm" id="prog-send">Send</button></div>
+    </div>
+    <div class="kb-row">
+      <div class="wheels">
+        <label class="wheel"><input type="range" id="bend" min="-8192" max="8191" value="0" aria-label="Pitch bend">Bend</label>
+        <label class="wheel"><input type="range" id="mod" min="0" max="127" value="0" aria-label="Modulation (CC 1)">Mod</label>
+      </div>
+      <div class="keys" id="keys" aria-label="Piano keyboard"></div>
+    </div>
+    <p class="hint" style="margin-top:12px">
+      Computer keys: <kbd>A</kbd>–<kbd>'</kbd> play from the leftmost C, <kbd>W</kbd> <kbd>E</kbd> <kbd>T</kbd> <kbd>Y</kbd> <kbd>U</kbd> <kbd>O</kbd> <kbd>P</kbd> are the sharps,
+      <kbd>Z</kbd>/<kbd>X</kbd> octave, <kbd>C</kbd>/<kbd>V</kbd> velocity. Notes arriving from MIDI inputs light up in blue.
+    </p>
+  </section>
+
+  <section class="card" aria-labelledby="mon-h">
+    <div class="card-head">
+      <h2 id="mon-h">Monitor</h2>
+      <p class="hint">While on, shows whatever is routed to the Monitor column.</p>
+      <span class="spacer"></span>
+      <span class="count" id="mon-count">0 messages</span>
+      <button class="btn sm" id="mon-toggle" aria-pressed="false">Monitoring Off</button>
+      <button class="btn sm" id="mon-clear">Clear</button>
+    </div>
+    <div class="log" id="log" role="log" aria-live="off">
+      <div class="row head"><span>Time</span><span>From</span><span>Message</span><span>Ch</span><span>Data</span><span>Bytes</span></div>
+    </div>
+  </section>
+</main>
+
+<footer>
+  Runs entirely in your browser: nothing is uploaded and nothing is installed. Web MIDI works in Chrome, Edge, Opera and Firefox;
+  Safari and iOS browsers don’t support it. Routes and keyboard settings are remembered on this device.
+</footer>
+
+<div class="toast" id="toast" role="status"></div>
+
+<script>
+'use strict';
+
+/* ---------- state ---------- */
+
+const STORE = 'midi-patchbay:v1';
+const KB = 'kb';
+const MON = 'monitor';
+const TYPES = [
+  ['notes', 'Notes'], ['cc', 'CC'], ['prog', 'Program'], ['bend', 'Bend'],
+  ['at', 'Aftertouch'], ['sync', 'Clock/sync'], ['sysex', 'SysEx'],
+];
+const NOTE_NAMES = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B'];
+
+const state = loadState();
+let access = null;
+const sources = new Map();  // key -> {key, name, kind, port}
+const dests = new Map();
+let routing = new Map();    // srcKey -> [{rk, dst, cfg, held}]
+const heldByRoute = new Map(); // rk -> Map(inKey -> outKey) of sounding notes
+const warnedDests = new Set();
+
+function loadState() {
+  const base = { routes: {}, kb: { ch: 1, oct: 3, vel: 100 }, sysex: false };
+  try {
+    const s = JSON.parse(localStorage.getItem(STORE));
+    if (s && typeof s === 'object') {
+      return { routes: s.routes || {}, kb: { ...base.kb, ...s.kb }, sysex: !!s.sysex };
+    }
+  } catch {}
+  return base;
+}
+let saveTimer = 0;
+function save() {
+  clearTimeout(saveTimer);
+  saveTimer = setTimeout(() => {
+    try { localStorage.setItem(STORE, JSON.stringify(state)); } catch {}
+  }, 200);
+}
+
+const $ = (s) => document.querySelector(s);
+const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const routeKey = (src, dst) => src + '→' + dst;
+
+function defaultRoute(dst) {
+  return { on: dst === MON, chIn: 0, chOut: 0, tr: 0, notes: true, cc: true, prog: true, bend: true, at: true, sync: dst !== MON, sysex: true };
+}
+function getRoute(src, dst) {
+  const r = state.routes[routeKey(src, dst)];
+  return r ? { ...defaultRoute(dst), ...r } : defaultRoute(dst);
+}
+function setRoute(src, dst, patch) {
+  const rk = routeKey(src, dst);
+  const before = getRoute(src, dst);
+  state.routes[rk] = { ...before, ...patch };
+  if (before.on && !state.routes[rk].on) releaseRoute(rk, dst);
+  save();
+  rebuildRouting();
+}
+
+/* ---------- toast ---------- */
+
+let toastTimer = 0;
+function toast(msg) {
+  const t = $('#toast');
+  t.textContent = msg;
+  t.classList.add('show');
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => t.classList.remove('show'), 3200);
+}
+
+/* ---------- MIDI access ---------- */
+
+function setStatus(text, cls) {
+  const s = $('#status');
+  s.textContent = text;
+  s.className = 'status' + (cls ? ' ' + cls : '');
+}
+
+async function enableMidi(sysex) {
+  if (!navigator.requestMIDIAccess) {
+    showNotice('This browser has no Web MIDI. Use Chrome, Edge, Opera or Firefox on a computer or Android. The keyboard and monitor still work here.');
+    setStatus('No Web MIDI', 'err');
+    return;
+  }
+  try {
+    setStatus('Asking permission…');
+    const acc = await navigator.requestMIDIAccess({ sysex });
+    attach(acc);
+    state.sysex = sysex;
+    save();
+  } catch (e) {
+    if (sysex) {
+      $('#sysex').checked = false;
+      toast('SysEx permission was refused, so MIDI is running without it.');
+      if (!access) return enableMidi(false);
+      state.sysex = false;
+      save();
+      updateStatus();
+      return;
+    }
+    setStatus('MIDI blocked', 'err');
+    showNotice('The browser refused MIDI access (' + (e && e.name || 'error') + '). Allow MIDI for this site in the address bar’s site settings, then press Enable MIDI again.');
+  }
+}
+
+function attach(acc) {
+  if (access && access !== acc) {
+    for (const i of access.inputs.values()) i.onmidimessage = null;
+    access.onstatechange = null;
+  }
+  access = acc;
+  acc.onstatechange = scheduleRefresh;
+  $('#enable').hidden = true;
+  $('#sysex').checked = !!acc.sysexEnabled;
+  hideNotice();
+  refresh();
+}
+
+let refreshTimer = 0;
+function scheduleRefresh() {
+  clearTimeout(refreshTimer);
+  refreshTimer = setTimeout(refresh, 60);
+}
+
+function uniqueKeys(prefix, ports) {
+  const seen = new Map();
+  const out = [];
+  for (const p of ports) {
+    if (p.state === 'disconnected') continue;
+    const name = p.name || 'Unnamed port';
+    const n = (seen.get(name) || 0) + 1;
+    seen.set(name, n);
+    const label = n > 1 ? `${name} (${n})` : name;
+    out.push({ key: prefix + label, name: label, port: p, manufacturer: p.manufacturer || '' });
+  }
+  return out;
+}
+
+function refresh() {
+  sources.clear();
+  dests.clear();
+  sources.set(KB, { key: KB, name: 'On-screen keyboard', kind: 'kb' });
+  if (access) {
+    for (const s of uniqueKeys('in:', access.inputs.values())) {
+      s.kind = 'in';
+      sources.set(s.key, s);
+      const key = s.key;
+      s.port.onmidimessage = (e) => onInput(key, e.data);
+    }
+    for (const d of uniqueKeys('out:', access.outputs.values())) {
+      d.kind = 'out';
+      dests.set(d.key, d);
+    }
+  }
+  dests.set(MON, { key: MON, name: 'Monitor', kind: 'mon' });
+  updateStatus();
+  renderMatrix();
+  rebuildRouting();
+}
+
+function updateStatus() {
+  if (!access) return;
+  const ins = sources.size - 1;
+  const outs = dests.size - 1;
+  setStatus(`${ins} in · ${outs} out${access.sysexEnabled ? ' · SysEx' : ''}`, 'ok');
+}
+
+function showNotice(text) { $('#notice-text').textContent = text; $('#notice').hidden = false; }
+function hideNotice() { $('#notice').hidden = true; }
+
+/* ---------- routing engine ---------- */
+
+function rebuildRouting() {
+  const next = new Map();
+  for (const src of sources.keys()) {
+    const list = [];
+    for (const dst of dests.keys()) {
+      const cfg = getRoute(src, dst);
+      if (!cfg.on) continue;
+      const rk = routeKey(src, dst);
+      let held = heldByRoute.get(rk);
+      if (!held) heldByRoute.set(rk, held = new Map());
+      list.push({ rk, dst, cfg, held });
+    }
+    if (list.length) next.set(src, list);
+  }
+  routing = next;
+  renderRoutes();
+}
+
+function dispatch(src, data) {
+  flash('s:' + src);
+  const list = routing.get(src);
+  if (!list) return;
+  for (const r of list) {
+    const out = transform(data, r);
+    if (out) deliver(r.dst, out, src);
+  }
+}
+
+// Applies one route's filters to a message. Note-offs follow the note-on they
+// belong to, so changing channel or transpose while a note sounds never strands it.
+function transform(d, r) {
+  const c = r.cfg;
+  const st = d[0];
+  if (st === 0xF0) return c.sysex ? d : null;
+  if (st > 0xF0) return c.sync ? d : null;
+  const type = st & 0xF0;
+  const ch = st & 0x0F;
+  if (type === 0x80 || (type === 0x90 && d[2] === 0)) {
+    const hk = (ch << 7) | d[1];
+    const m = r.held.get(hk);
+    if (m !== undefined) {
+      r.held.delete(hk);
+      return [type | (m >> 7), m & 127, d[2]];
+    }
+  }
+  if (c.chIn && ch !== c.chIn - 1) return null;
+  const oc = c.chOut ? c.chOut - 1 : ch;
+  switch (type) {
+    case 0x80:
+    case 0x90: {
+      if (!c.notes) return null;
+      const n = d[1] + c.tr;
+      if (n < 0 || n > 127) return null;
+      if (type === 0x90 && d[2] > 0) r.held.set((ch << 7) | d[1], (oc << 7) | n);
+      return [type | oc, n, d[2]];
+    }
+    case 0xA0: {
+      if (!c.at) return null;
+      const n = d[1] + c.tr;
+      return n < 0 || n > 127 ? null : [0xA0 | oc, n, d[2]];
+    }
+    case 0xB0: return c.cc ? [0xB0 | oc, d[1], d[2]] : null;
+    case 0xC0: return c.prog ? [0xC0 | oc, d[1]] : null;
+    case 0xD0: return c.at ? [0xD0 | oc, d[1]] : null;
+    case 0xE0: return c.bend ? [0xE0 | oc, d[1], d[2]] : null;
+  }
+  return null;
+}
+
+function deliver(dst, data, src) {
+  flash('d:' + dst);
+  if (dst === MON) { logMessage(src, data); return; }
+  const d = dests.get(dst);
+  if (!d) return;
+  try {
+    d.port.send(data);
+  } catch (e) {
+    if (!warnedDests.has(dst)) {
+      warnedDests.add(dst);
+      toast(data[0] === 0xF0 && !access.sysexEnabled
+        ? `SysEx to ${d.name} needs the SysEx switch on.`
+        : `Couldn't send to ${d.name}: ${e.message || e.name}`);
+    }
+  }
+}
+
+function releaseRoute(rk, dst) {
+  const held = heldByRoute.get(rk);
+  if (!held) return;
+  for (const m of held.values()) deliver(dst, [0x80 | (m >> 7), m & 127, 0], null);
+  held.clear();
+}
+
+function onInput(key, data) {
+  const st = data[0];
+  const type = st & 0xF0;
+  if (type === 0x90 || type === 0x80) markIncoming(data[1], type === 0x90 && data[2] > 0);
+  dispatch(key, data);
+}
+
+function panic() {
+  for (const k of [...kbHeld.keys()]) forceKbOff(k);
+  for (const code of [...pressedCodes.keys()]) pressedCodes.delete(code);
+  for (const [rk, held] of heldByRoute) held.clear();
+  for (const d of dests.values()) {
+    if (d.kind !== 'out') continue;
+    for (let ch = 0; ch < 16; ch++) {
+      try {
+        d.port.send([0xB0 | ch, 64, 0]);
+        d.port.send([0xB0 | ch, 123, 0]);
+        d.port.send([0xB0 | ch, 120, 0]);
+      } catch {}
+    }
+  }
+  inNotes.clear();
+  for (const el of keyEls.values()) el.classList.remove('in', 'down');
+  setSustain(false, false);
+  toast('All notes off sent to every output.');
+}
+
+/* ---------- activity LEDs ---------- */
+
+let leds = new Map();
+const ledTimers = new Map();
+function flash(id) {
+  const els = leds.get(id);
+  if (!els) return;
+  for (const el of els) el.classList.add('on');
+  clearTimeout(ledTimers.get(id));
+  ledTimers.set(id, setTimeout(() => { for (const el of els) el.classList.remove('on'); }, 70));
+}
+
+/* ---------- patch bay UI ---------- */
+
+function kindLabel(x) {
+  return x.kind === 'kb' ? 'virtual' : x.kind === 'mon' ? 'virtual' : '';
+}
+function loopRisk(src, dst) {
+  const s = sources.get(src), d = dests.get(dst);
+  return s && d && s.kind === 'in' && d.kind === 'out' && s.name === d.name;
+}
+
+function renderMatrix() {
+  const t = $('#matrix');
+  let h = '<thead><tr><th class="corner">from ↓ &nbsp; to →</th>';
+  for (const d of dests.values()) {
+    h += `<th class="col" data-col="${esc(d.key)}" title="${esc(d.name)}"><span class="vname"><span class="led" data-led="${esc('d:' + d.key)}"></span>${esc(d.name)}${d.kind === 'mon' ? ' <span class="kind">(log)</span>' : ''}</span></th>`;
+  }
+  h += '</tr></thead><tbody>';
+  for (const s of sources.values()) {
+    h += `<tr><th title="${esc(s.name)}"><span class="rname"><span class="led" data-led="${esc('s:' + s.key)}"></span>${esc(s.name)}${s.kind === 'kb' ? ' <span class="kind">(virtual)</span>' : ''}</span></th>`;
+    for (const d of dests.values()) {
+      const on = getRoute(s.key, d.key).on;
+      const risk = loopRisk(s.key, d.key);
+      h += `<td><button class="cell${risk ? ' warn' : ''}" data-src="${esc(s.key)}" data-dst="${esc(d.key)}" aria-pressed="${on}" title="${esc(s.name)} → ${esc(d.name)}${risk ? ' (same device: may feed back)' : ''}" aria-label="Route ${esc(s.name)} to ${esc(d.name)}"></button></td>`;
+    }
+    h += '</tr>';
+  }
+  h += '</tbody>';
+  t.innerHTML = h;
+  leds = new Map();
+  for (const el of t.querySelectorAll('[data-led]')) {
+    const k = el.dataset.led;
+    if (!leds.has(k)) leds.set(k, []);
+    leds.get(k).push(el);
+  }
+}
+
+$('#matrix').addEventListener('click', (e) => {
+  const b = e.target.closest('.cell');
+  if (!b) return;
+  const { src, dst } = b.dataset;
+  const on = b.getAttribute('aria-pressed') !== 'true';
+  b.setAttribute('aria-pressed', on);
+  setRoute(src, dst, { on });
+  if (on && loopRisk(src, dst)) toast('Input and output of the same port: if it echoes, this will loop.');
+});
+$('#matrix').addEventListener('pointerover', (e) => {
+  const b = e.target.closest('.cell');
+  for (const el of document.querySelectorAll('.matrix .hl')) el.classList.remove('hl');
+  if (!b) return;
+  const col = [...document.querySelectorAll('.matrix th.col')].find((th) => th.dataset.col === b.dataset.dst);
+  if (col) col.classList.add('hl');
+});
+$('#matrix').addEventListener('pointerleave', () => {
+  for (const el of document.querySelectorAll('.matrix .hl')) el.classList.remove('hl');
+});
+
+function chOptions(sel, zeroLabel) {
+  let h = `<option value="0"${sel === 0 ? ' selected' : ''}>${zeroLabel}</option>`;
+  for (let i = 1; i <= 16; i++) h += `<option value="${i}"${sel === i ? ' selected' : ''}>${i}</option>`;
+  return h;
+}
+
+function renderRoutes() {
+  const box = $('#routes');
+  if (box.contains(document.activeElement) && document.activeElement.matches('input[type="number"]')) return;
+  let h = '';
+  for (const s of sources.values()) {
+    for (const d of dests.values()) {
+      const c = getRoute(s.key, d.key);
+      if (!c.on) continue;
+      const rk = esc(routeKey(s.key, d.key));
+      h += `<div class="route" data-src="${esc(s.key)}" data-dst="${esc(d.key)}">
+        <div class="path"><span>${esc(s.name)}</span><span class="arrow">→</span><span>${esc(d.name)}</span></div>
+        <label class="field">Ch in <select data-f="chIn">${chOptions(c.chIn, 'Any')}</select></label>
+        <label class="field">Ch out <select data-f="chOut">${chOptions(c.chOut, 'Same')}</select></label>
+        <label class="field">Transpose <input type="number" data-f="tr" min="-48" max="48" step="1" value="${c.tr}"></label>
+        <div class="chips">${TYPES.map(([k, l]) => `<button class="chip" data-f="${k}" aria-pressed="${!!c[k]}">${l}</button>`).join('')}</div>
+        <button class="btn sm" data-f="off" aria-label="Disconnect">Disconnect</button>
+      </div>`;
+    }
+  }
+  box.innerHTML = h || '<div class="empty">Nothing is connected yet. Click a square in the grid above.</div>';
+}
+
+function routeOf(el) {
+  const r = el.closest('.route');
+  return r && [r.dataset.src, r.dataset.dst];
+}
+$('#routes').addEventListener('click', (e) => {
+  const b = e.target.closest('button[data-f]');
+  if (!b) return;
+  const [src, dst] = routeOf(b);
+  const f = b.dataset.f;
+  if (f === 'off') {
+    setRoute(src, dst, { on: false });
+    renderMatrix();
+    return;
+  }
+  setRoute(src, dst, { [f]: b.getAttribute('aria-pressed') !== 'true' });
+});
+$('#routes').addEventListener('change', (e) => {
+  const el = e.target.closest('[data-f]');
+  if (!el || el.tagName === 'BUTTON') return;
+  const [src, dst] = routeOf(el);
+  let v = parseInt(el.value, 10) || 0;
+  if (el.dataset.f === 'tr') v = Math.max(-48, Math.min(48, v));
+  const rk = routeKey(src, dst);
+  // Keep sounding notes mapped as they were; new notes take the new setting.
+  state.routes[rk] = { ...getRoute(src, dst), [el.dataset.f]: v };
+  save();
+  el.blur();
+  rebuildRouting();
+});
+
+/* ---------- monitor ---------- */
+
+const T0 = performance.now();
+let monOn = false;
+let monCount = 0;
+let monQueue = [];
+let monRaf = 0;
+const MON_MAX = 400;
+const CC_NAMES = { 0: 'Bank MSB', 1: 'Mod', 2: 'Breath', 7: 'Volume', 10: 'Pan', 11: 'Expression', 32: 'Bank LSB', 64: 'Sustain', 65: 'Portamento', 66: 'Sostenuto', 67: 'Soft', 120: 'All sound off', 121: 'Reset ctrls', 123: 'All notes off' };
+
+function noteName(n) { return NOTE_NAMES[n % 12] + (Math.floor(n / 12) - 1); }
+
+function describe(d) {
+  const st = d[0];
+  if (st >= 0xF0) {
+    const sys = (name, data = '') => ['sys', name, '', data];
+    switch (st) {
+      case 0xF0: return sys('SysEx', d.length + ' bytes');
+      case 0xF1: return sys('MTC quarter frame', d[1]);
+      case 0xF2: return sys('Song position', ((d[2] << 7) | d[1]) + ' sixteenths');
+      case 0xF3: return sys('Song select', d[1]);
+      case 0xF6: return sys('Tune request');
+      case 0xF8: return sys('Clock');
+      case 0xFA: return sys('Start');
+      case 0xFB: return sys('Continue');
+      case 0xFC: return sys('Stop');
+      case 0xFE: return sys('Active sensing');
+      case 0xFF: return sys('Reset');
+      default: return sys('System 0x' + st.toString(16).toUpperCase());
+    }
+  }
+  const ch = (st & 15) + 1;
+  switch (st & 0xF0) {
+    case 0x80: return ['note', 'Note off', ch, `${noteName(d[1])} (${d[1]}) vel ${d[2]}`];
+    case 0x90: return d[2] ? ['note', 'Note on', ch, `${noteName(d[1])} (${d[1]}) vel ${d[2]}`] : ['note', 'Note off', ch, `${noteName(d[1])} (${d[1]}) vel 0`];
+    case 0xA0: return ['cc', 'Poly aftertouch', ch, `${noteName(d[1])} = ${d[2]}`];
+    case 0xB0: return ['cc', 'Control change', ch, `CC ${d[1]}${CC_NAMES[d[1]] ? ' ' + CC_NAMES[d[1]] : ''} = ${d[2]}`];
+    case 0xC0: return ['cc', 'Program change', ch, `${d[1] + 1}`];
+    case 0xD0: return ['cc', 'Channel pressure', ch, `${d[1]}`];
+    case 0xE0: return ['cc', 'Pitch bend', ch, `${((d[2] << 7) | d[1]) - 8192}`];
+  }
+  return ['sys', 'Unknown', '', ''];
+}
+
+function hex(d) {
+  const n = Math.min(d.length, 12);
+  let s = '';
+  for (let i = 0; i < n; i++) s += (i ? ' ' : '') + d[i].toString(16).toUpperCase().padStart(2, '0');
+  return d.length > n ? s + ' …' : s;
+}
+
+function fmtTime(ms) {
+  const s = ms / 1000;
+  const m = Math.floor(s / 60);
+  return `${m}:${(s % 60).toFixed(3).padStart(6, '0')}`;
+}
+
+function logMessage(src, data) {
+  if (!monOn) return;
+  monCount++;
+  monQueue.push([performance.now() - T0, src, Array.from(data)]);
+  if (monQueue.length > MON_MAX) monQueue = monQueue.slice(-MON_MAX);
+  if (!monRaf) monRaf = requestAnimationFrame(flushLog);
+}
+
+function flushLog() {
+  monRaf = 0;
+  const log = $('#log');
+  const atBottom = log.scrollHeight - log.scrollTop - log.clientHeight < 24;
+  const frag = document.createDocumentFragment();
+  for (const [t, src, d] of monQueue) {
+    const [cls, name, ch, data] = describe(d);
+    const row = document.createElement('div');
+    row.className = 'row';
+    const s = sources.get(src);
+    row.innerHTML = `<span class="t">${fmtTime(t)}</span><span>${esc(s ? s.name : src || '—')}</span><span class="ty-${cls}">${esc(name)}</span><span>${ch}</span><span>${esc(data)}</span><span class="hex">${hex(d)}</span>`;
+    frag.appendChild(row);
+  }
+  monQueue = [];
+  log.appendChild(frag);
+  const rows = log.querySelectorAll('.row:not(.head)');
+  for (let i = 0; i < rows.length - MON_MAX; i++) rows[i].remove();
+  if (atBottom) log.scrollTop = log.scrollHeight;
+  $('#mon-count').textContent = `${monCount} message${monCount === 1 ? '' : 's'}`;
+}
+
+$('#mon-toggle').addEventListener('click', (e) => {
+  monOn = !monOn;
+  e.currentTarget.setAttribute('aria-pressed', monOn);
+  e.currentTarget.textContent = monOn ? 'Monitoring On' : 'Monitoring Off';
+});
+$('#mon-clear').addEventListener('click', () => {
+  for (const r of $('#log').querySelectorAll('.row:not(.head)')) r.remove();
+  monCount = 0;
+  $('#mon-count').textContent = '0 messages';
+});
+
+/* ---------- keyboard ---------- */
+
+const keysEl = $('#keys');
+const keyEls = new Map();      // note -> element
+const kbHeld = new Map();      // note -> {count, ch}
+const inNotes = new Map();     // note -> count of notes held on inputs
+const pressedCodes = new Map(); // KeyboardEvent.code -> note
+const pointerNotes = new Map(); // pointerId -> note
+const KEYMAP = {
+  KeyA: 0, KeyW: 1, KeyS: 2, KeyE: 3, KeyD: 4, KeyF: 5, KeyT: 6, KeyG: 7, KeyY: 8,
+  KeyH: 9, KeyU: 10, KeyJ: 11, KeyK: 12, KeyO: 13, KeyL: 14, KeyP: 15, Semicolon: 16, Quote: 17,
+};
+const CODE_LABEL = { Semicolon: ';', Quote: "'" };
+const IS_BLACK = [0, 1, 0, 1, 0, 0, 1, 0, 1, 0, 1, 0];
+let sustainOn = false;
+
+const kbCh = () => state.kb.ch - 1;
+const baseNote = () => (state.kb.oct + 1) * 12;
+
+function buildKeys() {
+  const w = keysEl.clientWidth || 600;
+  const whiteW = w < 520 ? 34 : 40;
+  const octaves = Math.max(1, Math.min(5, Math.floor((w / whiteW - 1) / 7)));
+  const base = baseNote();
+  const last = base + octaves * 12;
+  const whites = [];
+  for (let n = base; n <= last; n++) if (!IS_BLACK[n % 12]) whites.push(n);
+  const pct = 100 / whites.length;
+  const labels = new Map();
+  for (const [code, off] of Object.entries(KEYMAP)) labels.set(base + off, CODE_LABEL[code] || code.slice(3));
+
+  keysEl.innerHTML = '';
+  keyEls.clear();
+  let wi = 0;
+  for (let n = base; n <= last; n++) {
+    const el = document.createElement('div');
+    el.dataset.note = n;
+    const black = IS_BLACK[n % 12];
+    el.className = 'key ' + (black ? 'black' : 'white') + (n > 127 ? ' off' : '');
+    if (black) {
+      el.style.left = `calc(${wi * pct}% - ${pct * 0.3}%)`;
+      el.style.width = pct * 0.6 + '%';
+    } else {
+      wi++;
+    }
+    const ck = labels.get(n);
+    const name = n % 12 === 0 ? noteName(n) : '';
+    if (ck || name) el.innerHTML = `<span class="lab">${ck ? `<span class="ck">${esc(ck)}</span>` : ''}${name}</span>`;
+    if (kbHeld.has(n)) el.classList.add('down');
+    if (inNotes.get(n)) el.classList.add('in');
+    keysEl.appendChild(el);
+    keyEls.set(n, el);
+  }
+  $('#oct').textContent = noteName(base);
+}
+
+function sendKb(data) { dispatch(KB, data); }
+
+function kbOn(n) {
+  if (n < 0 || n > 127) return;
+  const h = kbHeld.get(n);
+  if (h) { h.count++; return; }
+  const ch = kbCh();
+  kbHeld.set(n, { count: 1, ch });
+  keyEls.get(n)?.classList.add('down');
+  sendKb([0x90 | ch, n, state.kb.vel]);
+}
+function kbOff(n) {
+  const h = kbHeld.get(n);
+  if (!h) return;
+  if (--h.count > 0) return;
+  forceKbOff(n);
+}
+function forceKbOff(n) {
+  const h = kbHeld.get(n);
+  if (!h) return;
+  kbHeld.delete(n);
+  keyEls.get(n)?.classList.remove('down');
+  sendKb([0x80 | h.ch, n, 0]);
+}
+
+function markIncoming(n, on) {
+  const c = (inNotes.get(n) || 0) + (on ? 1 : -1);
+  if (c > 0) inNotes.set(n, c); else inNotes.delete(n);
+  keyEls.get(n)?.classList.toggle('in', c > 0);
+}
+
+function noteAt(x, y) {
+  const el = document.elementFromPoint(x, y);
+  const k = el && el.closest('.key');
+  return k && keysEl.contains(k) && !k.classList.contains('off') ? +k.dataset.note : null;
+}
+
+keysEl.addEventListener('pointerdown', (e) => {
+  const n = noteAt(e.clientX, e.clientY);
+  if (n === null) return;
+  e.preventDefault();
+  keysEl.setPointerCapture(e.pointerId);
+  pointerNotes.set(e.pointerId, n);
+  kbOn(n);
+});
+keysEl.addEventListener('pointermove', (e) => {
+  if (!pointerNotes.has(e.pointerId)) return;
+  const n = noteAt(e.clientX, e.clientY);
+  const old = pointerNotes.get(e.pointerId);
+  if (n === old) return;
+  if (old !== null) kbOff(old);
+  if (n !== null) kbOn(n);
+  pointerNotes.set(e.pointerId, n);
+});
+function pointerEnd(e) {
+  if (!pointerNotes.has(e.pointerId)) return;
+  const n = pointerNotes.get(e.pointerId);
+  pointerNotes.delete(e.pointerId);
+  if (n !== null) kbOff(n);
+}
+keysEl.addEventListener('pointerup', pointerEnd);
+keysEl.addEventListener('pointercancel', pointerEnd);
+keysEl.addEventListener('contextmenu', (e) => e.preventDefault());
+
+function typingInField(e) {
+  const t = e.target;
+  return t instanceof HTMLElement && (t.isContentEditable || t.matches('input:not([type="range"]):not([type="checkbox"]), select, textarea'));
+}
+
+window.addEventListener('keydown', (e) => {
+  if (e.metaKey || e.ctrlKey || e.altKey || typingInField(e)) return;
+  if (e.code in KEYMAP) {
+    e.preventDefault();
+    if (e.repeat || pressedCodes.has(e.code)) return;
+    const n = baseNote() + KEYMAP[e.code];
+    pressedCodes.set(e.code, n);
+    kbOn(n);
+    return;
+  }
+  if (e.repeat) return;
+  if (e.code === 'KeyZ') shiftOctave(-1);
+  else if (e.code === 'KeyX') shiftOctave(1);
+  else if (e.code === 'KeyC') setVelocity(state.kb.vel - 10);
+  else if (e.code === 'KeyV') setVelocity(state.kb.vel + 10);
+});
+window.addEventListener('keyup', (e) => {
+  const n = pressedCodes.get(e.code);
+  if (n === undefined) return;
+  pressedCodes.delete(e.code);
+  kbOff(n);
+});
+window.addEventListener('blur', () => {
+  for (const [code, n] of pressedCodes) kbOff(n);
+  pressedCodes.clear();
+});
+
+function shiftOctave(d) {
+  state.kb.oct = Math.max(-1, Math.min(8, state.kb.oct + d));
+  save();
+  buildKeys();
+}
+function setVelocity(v) {
+  state.kb.vel = Math.max(1, Math.min(127, v));
+  $('#vel').value = state.kb.vel;
+  $('#vel-out').textContent = state.kb.vel;
+  save();
+}
+function setSustain(on, send = true) {
+  sustainOn = on;
+  $('#sustain').setAttribute('aria-pressed', on);
+  if (send) sendKb([0xB0 | kbCh(), 64, on ? 127 : 0]);
+}
+
+$('#oct-down').addEventListener('click', () => shiftOctave(-1));
+$('#oct-up').addEventListener('click', () => shiftOctave(1));
+$('#vel').addEventListener('input', (e) => setVelocity(+e.target.value));
+$('#sustain').addEventListener('click', () => setSustain(!sustainOn));
+$('#prog-send').addEventListener('click', () => {
+  const p = Math.max(1, Math.min(128, parseInt($('#prog').value, 10) || 1));
+  $('#prog').value = p;
+  sendKb([0xC0 | kbCh(), p - 1]);
+});
+$('#prog').addEventListener('keydown', (e) => { if (e.key === 'Enter') $('#prog-send').click(); });
+
+const kbChSel = $('#kb-ch');
+for (let i = 1; i <= 16; i++) kbChSel.add(new Option(i, i));
+kbChSel.value = state.kb.ch;
+kbChSel.addEventListener('change', () => {
+  if (sustainOn) setSustain(false);
+  state.kb.ch = +kbChSel.value;
+  save();
+  kbChSel.blur();
+});
+
+const bend = $('#bend');
+bend.addEventListener('input', () => {
+  const v = +bend.value + 8192;
+  sendKb([0xE0 | kbCh(), v & 127, v >> 7]);
+});
+function bendHome() {
+  if (+bend.value === 0) return;
+  bend.value = 0;
+  sendKb([0xE0 | kbCh(), 0, 64]);
+}
+bend.addEventListener('pointerup', bendHome);
+bend.addEventListener('change', bendHome);
+bend.addEventListener('blur', bendHome);
+$('#mod').addEventListener('input', (e) => sendKb([0xB0 | kbCh(), 1, +e.target.value]));
+
+new ResizeObserver(() => buildKeys()).observe(keysEl);
+
+/* ---------- boot ---------- */
+
+$('#enable').addEventListener('click', () => enableMidi($('#sysex').checked));
+$('#sysex').addEventListener('change', (e) => {
+  if (!access) return;
+  if (e.target.checked) enableMidi(true);
+  else {
+    e.target.checked = !!access.sysexEnabled;
+    if (access.sysexEnabled) toast('SysEx stays on until you reload the page.');
+  }
+});
+$('#panic').addEventListener('click', panic);
+
+setVelocity(state.kb.vel);
+$('#sysex').checked = state.sysex;
+refresh();
+buildKeys();
+
+if (!navigator.requestMIDIAccess) {
+  $('#enable').hidden = true;
+  setStatus('No Web MIDI', 'err');
+  showNotice('This browser has no Web MIDI, so only the on-screen keyboard and monitor work here. Use Chrome, Edge, Opera or Firefox on a computer or Android to reach MIDI devices.');
+} else if (navigator.permissions) {
+  // Reconnect without a click when this site already has MIDI permission.
+  navigator.permissions.query({ name: 'midi', sysex: state.sysex })
+    .then((p) => { if (p.state === 'granted' && !access) enableMidi(state.sysex); })
+    .catch(() => {});
+}
+</script>
+</body>
+</html>
