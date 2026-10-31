@@ -149,7 +149,11 @@ main {
 .notice p { margin: 0; }
 
 /* patch bay matrix */
-.matrix-wrap { overflow-x: auto; margin: 0 -4px; padding: 0 4px 4px; }
+.bay { display: flex; flex-wrap: wrap; align-items: flex-start; gap: 16px 32px; }
+.matrix-wrap { overflow-x: auto; margin: 0 -4px; padding: 0 4px 4px; min-width: 0; max-width: 100%; }
+.move-screen { margin: 0 0 0 auto; max-width: 100%; align-self: center; }
+.move-screen canvas { display: block; max-width: 100%; }
+.move-screen figcaption { margin-top: 6px; color: var(--muted); font-size: 12.5px; max-width: 48ch; }
 .matrix { border-collapse: separate; border-spacing: 0; }
 .matrix th { font-weight: 500; text-align: left; }
 .matrix thead th.col {
@@ -436,7 +440,13 @@ footer a { color: inherit; }
       <h2 id="bay-h">Patch bay</h2>
       <p class="hint">Rows send, columns receive. Click a square to connect them.</p>
     </div>
-    <div class="matrix-wrap"><table class="matrix" id="matrix"></table></div>
+    <div class="bay">
+      <div class="matrix-wrap"><table class="matrix" id="matrix"></table></div>
+      <figure class="move-screen" id="move-screen" hidden>
+        <canvas id="move-view" aria-label="The Ableton Move’s screen, with the audio it takes in"></canvas>
+        <figcaption id="move-note"></figcaption>
+      </figure>
+    </div>
     <details class="routes-box" id="routes-box">
       <summary><h3>Route settings</h3> <span class="count" id="routes-count"></span></summary>
       <div class="routes" id="routes"></div>
@@ -710,6 +720,7 @@ function refresh() {
   updateStatus();
   renderMatrix();
   rebuildRouting();
+  updateMovePresence();
 }
 
 function updateStatus() {
@@ -746,13 +757,16 @@ function rebuildRouting() {
   for (const list of routing.values()) connected += list.length;
   $('#routes-count').textContent = connected ? `${connected} connected` : 'none connected';
   renderRoutes();
+  schedulePanel();
+  const look = chainLook(moveChain());
+  if (look) look.read();
 }
 
 const outBuf = [];
 function dispatch(src, data) {
   flash('s:' + src);
-  // Clock runs all the time, so it would keep the video's lights on.
-  const seen = view.on && data[0] < 0xF8;
+  // Clock runs all the time, so it would keep the lights on.
+  const seen = (view.on || move.schwung) && data[0] < 0xF8;
   if (seen) view.active.set('s:' + src, performance.now());
   if (learning && learning.src === src) learnFrom(data);
   const list = routing.get(src);
@@ -936,6 +950,10 @@ function deliver(dst, data, src) {
   if (dst === MON) { logMessage(src, data); return; }
   const d = dests.get(dst);
   if (!d) return;
+  if ((data[0] & 0xF0) === 0xC0) {
+    const look = DEVICE_LOOKS.find((l) => l.test.test(d.name));
+    if (look) look.changed();
+  }
   try {
     d.port.send(data);
   } catch (e) {
@@ -959,6 +977,7 @@ function onInput(key, data) {
   const st = data[0];
   const type = st & 0xF0;
   if (type === 0x90 || type === 0x80) markIncoming(data[1], type === 0x90 && data[2] > 0);
+  else if (st === 0xF0 && PRO800.port.test(sources.get(key).name)) onPro800Sysex(data);
   dispatch(key, data);
 }
 
@@ -1757,6 +1776,7 @@ function startMp3Worker(t) {
 }
 
 const TAB_SOURCE = 'tab';
+const MOVE_SOURCE = 'move';
 const WAV_MAX = 0xFFFFFFFF - 44;       // a RIFF size field is 32 bits
 const SPILL_BYTES = 8 * 1024 * 1024;   // gather into Blobs, which the browser may keep on disk
 
@@ -1794,6 +1814,11 @@ async function refreshRecSources() {
     o.dataset.name = recSourceId(d);
     recSrc.add(o);
   });
+  if (move.schwung) {
+    const o = new Option('Move (Schwung stream)', MOVE_SOURCE);
+    o.dataset.name = MOVE_SOURCE;
+    recSrc.add(o);
+  }
   if (navigator.mediaDevices.getDisplayMedia) recSrc.add(new Option('Tab or system audio…', TAB_SOURCE));
   const opts = [...recSrc.options];
   const pick = keep !== null
@@ -1803,6 +1828,7 @@ async function refreshRecSources() {
 }
 
 function openRecSource(value) {
+  if (value === MOVE_SOURCE) return openMoveAudio();
   if (value === TAB_SOURCE) {
     // The picker insists on video; the video track is simply never used.
     return navigator.mediaDevices.getDisplayMedia({
@@ -1843,7 +1869,7 @@ async function armRecorder() {
     stream = await openRecSource(value);
     const track = stream.getAudioTracks()[0];
     if (!track) throw Object.assign(new Error('That share has no audio. Pick a tab or screen and turn on sharing its audio.'), { name: 'NoAudio' });
-    const rate = recContextRate(track.getSettings().sampleRate);
+    const rate = recContextRate(value === MOVE_SOURCE ? MOVE_RATE : track.getSettings().sampleRate);
     ctx = new AudioContext(rate ? { sampleRate: rate, latencyHint: 'playback' } : { latencyHint: 'playback' });
     const url = URL.createObjectURL(new Blob([TAP_SRC], { type: 'text/javascript' }));
     try { await ctx.audioWorklet.addModule(url); } finally { URL.revokeObjectURL(url); }
@@ -1866,12 +1892,14 @@ async function armRecorder() {
     rec.node = node;
     rec.bus = bus;
     rec.mix = mix.stream;
-    rec.source = value === TAB_SOURCE ? track.label || 'Tab audio' : track.label || recSrc.selectedOptions[0].text;
+    rec.source = value === MOVE_SOURCE ? 'Ableton Move'
+      : value === TAB_SOURCE ? track.label || 'Tab audio' : track.label || recSrc.selectedOptions[0].text;
     rec.ch = 0;
     ok = true;
   } catch (e) {
     if (stream) for (const t of stream.getTracks()) t.stop();
     if (ctx) ctx.close().catch(() => {});
+    closeMoveAudio();
     const msg = e.name === 'NoAudio' ? e.message : recOpenError(e, value);
     if (msg) toast(msg);
   }
@@ -1886,6 +1914,7 @@ function disarmRecorder() {
     for (const t of rec.stream.getTracks()) { t.onended = null; t.stop(); }
   }
   if (rec.ctx) rec.ctx.close().catch(() => {});
+  closeMoveAudio();
   rec.stream = rec.ctx = rec.node = rec.bus = rec.mix = null;
   rec.disarmAfter = false;
   rec.shown = [0, 0];
@@ -2057,6 +2086,7 @@ function drawRecMeter() {
   $('#rec-m0').style.transform = `scaleX(${meterPos(rec.shown[0])})`;
   $('#rec-m1').style.transform = `scaleX(${meterPos(rec.shown[1])})`;
   if (rec.stream) $('#rec-db').textContent = fmtDb(Math.max(rec.shown[0], rec.shown[1]));
+  schedulePanel();
 }
 
 function encodePcm24(f) {
@@ -2214,10 +2244,13 @@ const VIEW_W = 1280;
 const VIEW_M = 40;
 // Bitrates suit flat graphics: lower than this, halos show around the keys.
 const VIEW_SHAPES = {
-  square: { h: 1280, title: 28, meter: 5, label: 26, rowH: 66, rise: 200, videoBps: 500000 },
-  vertical: { h: 2276, title: 34, meter: 7, label: 32, rowH: 96, rise: 300, videoBps: 900000 },
+  square: { h: 1280, title: 28, meter: 5, label: 26, tag: 19, rowH: 66, rise: 200, screen: 4, videoBps: 500000 },
+  vertical: { h: 2276, title: 34, meter: 7, label: 32, tag: 23, rowH: 96, rise: 300, screen: 7, videoBps: 900000 },
 };
-const VIEW_COLORS = { bg: '#101014', band: '#17151a', text: '#ecebe8', muted: '#9a968e', idle: '#3b3b44', keyboard: '#ff7a2e', input: '#7c95ff' };
+// The page's panel beside the patch bay, drawn by the same code.
+const PANEL_SHAPE = { label: 13, tag: 12, screen: 3 };
+const PANEL_W = 480, PANEL_M = 8;
+const VIEW_COLORS = { bg: '#101014', band: '#17151a', text: '#ecebe8', muted: '#9a968e', idle: '#3b3b44', keyboard: '#ff7a2e', input: '#7c95ff', audio: '#51cf8a' };
 const view = {
   on: false, canvas: null, g: null, ticker: null, shape: VIEW_SHAPES.square,
   active: new Map(),   // route, source or destination -> time of its last message
@@ -2233,6 +2266,7 @@ function noteViewRoute(r) {
   if (now - (view.active.get(r.rk) || -1e9) > 120 && view.pulses.length < 200) view.pulses.push({ rk: r.rk, at: now });
   view.active.set(r.rk, now);
   view.active.set('d:' + r.dst, now);
+  schedulePanel();
 }
 
 // A worker keeps the time: timers and animation frames slow down in a background tab.
@@ -2325,6 +2359,9 @@ function buildViewLayout(g, S, top, keyBandTop) {
   };
   dsts = order(dsts, srcs, (r) => [r.dst, srcOf.get(r.rk)]);
   const sortedSrcs = order(srcs, dsts, (r) => [srcOf.get(r.rk), r.dst]);
+  // The piped port goes last in its column, so the cable down to the screen crosses no other.
+  const chain = moveChain();
+  if (chain) dsts = [...dsts.filter((d) => d.key !== chain.dst), ...dsts.filter((d) => d.key === chain.dst)];
 
   const rows = Math.max(sortedSrcs.length, dsts.length);
   const room = keyBandTop - top;
@@ -2336,7 +2373,8 @@ function buildViewLayout(g, S, top, keyBandTop) {
   const W = VIEW_W - 2 * VIEW_M;
   const widest = (list, cap) => Math.min(cap, Math.max(0, ...list.map((p) => g.measureText(label(p)).width)));
   const leftW = widest(sortedSrcs, W * 0.38), rightW = widest(dsts, W * 0.32);
-  const lx = VIEW_M + leftW + 22, rx = VIEW_W - VIEW_M - rightW - 22;
+  const gap = S.label * 0.85;
+  const lx = VIEW_M + leftW + gap, rx = VIEW_W - VIEW_M - rightW - gap;
   const place = (list, x) => new Map(list.map((p, i) => [p.key, {
     p, x, y: top + height / 2 + (i - (list.length - 1) / 2) * rowH, text: fitText(g, label(p), x === lx ? leftW : rightW),
   }]));
@@ -2346,7 +2384,15 @@ function buildViewLayout(g, S, top, keyBandTop) {
     const c = (rx - lx) * 0.5;
     return { rk: r.rk, color: viewColor(a.p), a, b, c1x: a.x + c, c2x: b.x - c };
   });
-  const zoneTop = top + height + (rows ? 16 : 0);
+  const stack = layoutViewStack(S, top + height + (rows ? S.rowH : 0), keyBandTop, chainLook(chain));
+  const screen = stack && stack.screen, face = stack && stack.face;
+  const zoneTop = (stack ? stack.bottom : top + height) + (rows || stack ? 16 : 0);
+  let pipe = null, stub = null;
+  if (chain && screen) {
+    const midi = cables.find((c) => c.rk === chain.rk);
+    if (face) stub = pipeTo(S, right.get(chain.dst), face, midi);
+    pipe = pipeTo(S, face ? { x: stub.toX, y: face.y + face.h } : right.get(chain.dst), screen, midi);
+  }
   const fade = (color) => {
     const grad = g.createLinearGradient(0, zoneTop, 0, keyBandTop);
     grad.addColorStop(0, color + '00');
@@ -2355,8 +2401,436 @@ function buildViewLayout(g, S, top, keyBandTop) {
   };
   return {
     forRouting: routing, left, right, cables, byRk: new Map(cables.map((c) => [c.rk, c])),
-    zoneTop, fades: { [VIEW_COLORS.keyboard]: fade(VIEW_COLORS.keyboard), [VIEW_COLORS.input]: fade(VIEW_COLORS.input) },
+    screen, face, stub, pipe, zoneTop, fades: { [VIEW_COLORS.keyboard]: fade(VIEW_COLORS.keyboard), [VIEW_COLORS.input]: fade(VIEW_COLORS.input) },
   };
+}
+
+// The PRO 8000's faceplate as its editor draws it (tools/web in the pro-8000 repository), in that
+// page's pixels: a 1348 × 550 plate. Knobs are the dial's top-left, the label, the init sound's value,
+// flags (a = amber, shared by both layers; b = a bipolar scale; s = the LFO shape selector) and the
+// parameter's number in the synth's reply. Levers are the slot's top-left, the top label or wave icon,
+// the bottom label, whether it's up and the panel switch's number.
+const PRO800 = {
+  w: 1348, h: 550, plate: '#111214', silk: '#f1f1ec', frame: '#deded8', red: '#ff4a36',
+  sections: [
+    [17, 21, 666, 88.5, 'Oscillator A'], [17, 124.5, 666, 126.6, 'Oscillator B'], [17, 266.1, 550.8, 129.6, 'Poly-mod'],
+    [579.8, 266.1, 103.3, 129.6, ''], [17, 410.7, 550.8, 124, 'LFO-mod'], [579.8, 410.7, 103.3, 124, ''],
+    [695, 124.5, 503.5, 271.2, 'Filter'], [695, 410.7, 503.5, 124, 'Amplifier'],
+  ],
+  knobs: [
+    [26, 40.5, 'Frequency', .5, 'b', 10], [250, 40.5, 'Pulse width', .5, 'a', 13], [322, 40.5, 'Level', .8, 'a', 15],
+    [26, 182.1, 'Frequency', .5, 'b', 11], [98, 182.1, 'Fine', .5, 'b', 12], [284, 182.1, 'Pulse width', .5, 'a', 14], [356, 182.1, 'Level', 0, 'a', 21],
+    [66.9, 296.1, 'Fil env', 0, '', 23], [138.9, 296.1, 'Osc B', 0, 'a', 22], [599.4, 301.9, 'Noise', 0, 'a', 25],
+    [49.4, 448, 'Frequency', .5, '', 17], [168.3, 448, 'Shape', 0, 's', -1], [287.1, 439.3, 'Initial amount', 0, '', 18], [599.4, 443.7, 'Glide', 0, '', 16],
+    [730.5, 206.2, 'Cutoff', 1, '', 24], [853.3, 206.2, 'Resonance', 0, 'a', 8], [976.2, 197.5, 'Envelope amount', .5, 'b', 9],
+    [704, 293.2, 'Attack', 0, '', 7], [774, 293.2, 'Decay', .5, '', 6], [844, 293.2, 'Sustain', 1, '', 5], [914, 293.2, 'Release', .25, '', 4],
+    [1238.7, 168, 'Macro 1', .5, 'b', 19],
+    [704, 443.7, 'Attack', 0, '', 3], [774, 443.7, 'Decay', .5, '', 2], [844, 443.7, 'Sustain', 1, '', 1], [914, 443.7, 'Release', .25, '', 0],
+    [1238.7, 441.2, 'Volume', .8, 'a', 20],
+  ],
+  levers: [
+    [106, 59.5, 'SYNC', 'OFF', 0, 15], [144, 48, 'saw', '', 1, 0], [182, 48, 'tri', '', 0, 1], [220, 48, 'sq', '', 0, 2],
+    [178, 189.6, 'saw', '', 1, 3], [216, 189.6, 'tri', '', 0, 4], [254, 189.6, 'sq', '', 0, 5],
+    [314.1, 315.1, 'FREQ A', '', 0, 8], [355.2, 315.1, 'FILTER', '', 0, 11], [491.5, 326.6, 'UNISON', 'OFF', 0, 12],
+    [421.4, 455.5, 'FREQ A-B', '', 0, 7], [470.1, 455.5, 'PW A-B', '', 0, 6], [512.4, 455.5, 'FILTER', '', 0, 10],
+  ],
+  waves: { saw: 'M1 12 11 2V12L21 2V12', tri: 'M1 12 6 2 11 12 16 2 21 12', sq: 'M1 12V2H11V12H21V2' },
+  lfoShapes: ['TRI', 'SQR', 'UP', 'DN', 'SIN', 'S&H', 'DRF', 'STP', 'NOI'],
+  tracking: { x: 1106.5, y: 214.2, names: ['FULL', 'HALF', 'OFF'], full: 14, half: 13, label: [1131, 257.2, 'Keyboard tracking'] },
+  viz: [[392, 34, 284, 67.5, 'osc'], [426, 137.5, 250, 105.6, 'osc'], [706, 137.5, 481.5, 58, 'flt'], [986, 271.2, 205.5, 52, 'env'], [986, 421.7, 205.5, 52, 'env']],
+  caps: [[134, 94, 110, 'Shape'], [168, 235.6, 110, 'Shape'], [64.9, 361.1, 140, 'Source amount'], [290.7, 361.1, 100.7, 'Destination'], [403.9, 501.5, 133.4, 'Destination'], [702, 380.2, 489.5, 'Filter envelope']],
+  header: [0xF0, 0x00, 0x20, 0x32, 0x00, 0x01, 0x24, 0x00],
+  port: /pro.?8000?/i,
+  values: null,     // the knobs, 0-1, as last read from the synth
+  switches: null,   // the panel switches, as last read
+  waiters: [],
+  reread: 0,
+};
+
+// The synth's own settings, read once over SysEx with the editor's read-only requests (`0x53 layer`
+// for every knob, `0x4C` for the switches), so the plate shows the sound it's set to. Not kept live:
+// asked again when a video starts and after a program change reaches the synth. Needs SysEx on.
+function pro800Ports() {
+  const out = [...dests.values()].find((d) => d.kind === 'out' && PRO800.port.test(d.name));
+  const inp = [...sources.values()].find((s) => s.kind === 'in' && PRO800.port.test(s.name));
+  return out && inp ? out : null;
+}
+
+function pro800Ask(out, data, ms = 1500) {
+  return new Promise((resolve) => {
+    const w = { prefix: data, resolve };
+    PRO800.waiters.push(w);
+    try {
+      out.port.send([...PRO800.header, ...data, 0xF7]);
+    } catch {
+      PRO800.waiters = PRO800.waiters.filter((x) => x !== w);
+      resolve(null);
+      return;
+    }
+    setTimeout(() => {
+      if (!PRO800.waiters.includes(w)) return;
+      PRO800.waiters = PRO800.waiters.filter((x) => x !== w);
+      resolve(null);
+    }, ms);
+  });
+}
+
+// Called for every SysEx arriving from the synth; the replies answer what's waiting.
+function onPro800Sysex(data) {
+  const H = PRO800.header;
+  if (!PRO800.waiters.length || data.length < H.length + 2 || H.some((b, i) => data[i] !== b)) return;
+  const d = Array.from(data.subarray(H.length, data.length - 1));
+  const w = PRO800.waiters.find((x) => x.prefix.every((b, i) => d[i] === b));
+  if (!w) return;
+  PRO800.waiters = PRO800.waiters.filter((x) => x !== w);
+  w.resolve(d);
+}
+
+async function readPro800() {
+  if (!access || !access.sysexEnabled || PRO800.waiters.length) return;
+  const out = pro800Ports();
+  if (!out) return;
+  const p = await pro800Ask(out, [0x53, 0]);
+  const b = await pro800Ask(out, [0x4C]);
+  if (p) PRO800.values = Array.from({ length: p[2] }, (_, i) => (p[3 + 2 * i] << 7 | p[4 + 2 * i]) / 16383);
+  if (b) PRO800.switches = b.slice(1);
+  if (p || b) schedulePanel();
+}
+
+// A program change takes a moment to load.
+function pro800Changed() {
+  clearTimeout(PRO800.reread);
+  PRO800.reread = setTimeout(readPro800, 400);
+}
+
+// Draws the plate w wide at (x, y). Text that would come out smaller than 4.5 px is left off, and the
+// section names are kept readable, so the plate still reads as the synth at a thumbnail's size.
+function drawPro800(g, x, y, w) {
+  const D = PRO800, k = w / D.w;
+  const fits = (px) => px * k >= 4.5;
+  const font = (px, weight = 800) => { g.font = `${weight} ${px}px system-ui, sans-serif`; };
+  const text = (s, tx, ty, px, color, align = 'center', spacing = 0.04) => {
+    font(px);
+    try { g.letterSpacing = `${px * spacing}px`; } catch {}
+    g.fillStyle = color;
+    g.textAlign = align;
+    g.fillText(s.toUpperCase(), tx, ty);
+    try { g.letterSpacing = '0px'; } catch {}
+  };
+  g.save();
+  g.translate(x, y);
+  g.scale(k, k);
+  g.lineJoin = 'round';
+  g.textBaseline = 'alphabetic';
+  g.fillStyle = D.plate;
+  g.beginPath();
+  g.roundRect(0, 0, D.w, D.h, 12);
+  g.fill();
+  g.strokeStyle = '#000';
+  g.lineWidth = 1;
+  g.stroke();
+  g.strokeStyle = '#0b0b0c';
+  g.lineWidth = 6;
+  g.beginPath();
+  g.roundRect(3, 3, D.w - 6, D.h - 6, 9);
+  g.stroke();
+
+  for (const [sx, sy, sw, sh, title] of D.sections) {
+    g.strokeStyle = D.frame;
+    g.lineWidth = 1.5;
+    g.beginPath();
+    g.roundRect(sx, sy, sw, sh, 9);
+    g.stroke();
+    if (!title) continue;
+    const px = Math.max(11.5, 7 / k);
+    font(px);
+    const tw = g.measureText(title.toUpperCase()).width * 1.07 + 16;
+    g.fillStyle = D.plate;
+    g.fillRect(sx + sw / 2 - tw / 2, sy - px * 0.6, tw, px * 1.2);
+    text(title, sx + sw / 2, sy + px * 0.36, px, D.silk, 'center', 0.07);
+  }
+  for (const [vx, vy, vw, vh, kind] of D.viz) {
+    g.fillStyle = '#131315';
+    g.beginPath();
+    g.roundRect(vx, vy, vw, vh, 4);
+    g.fill();
+    g.strokeStyle = '#1e1e21';
+    g.lineWidth = 1;
+    g.stroke();
+    g.strokeStyle = D.red;
+    g.globalAlpha = 0.55;
+    g.lineWidth = 1.5;
+    g.beginPath();
+    const mx = vx + 10, mw = vw - 20, my = vy + 8, mh = vh - 16;
+    if (kind === 'osc') {
+      for (let i = 0; i <= 3; i++) {
+        g.moveTo(mx + mw * i / 3, my + mh);
+        g.lineTo(mx + mw * (i + 1) / 3, my);
+        g.lineTo(mx + mw * (i + 1) / 3, my + mh);
+      }
+    } else if (kind === 'flt') {
+      g.moveTo(mx, my + mh * 0.45);
+      g.lineTo(mx + mw * 0.55, my + mh * 0.45);
+      g.quadraticCurveTo(mx + mw * 0.72, my + mh * 0.45, mx + mw * 0.75, my + mh * 0.2);
+      g.quadraticCurveTo(mx + mw * 0.8, my + mh * 0.6, mx + mw, my + mh);
+    } else {
+      g.moveTo(mx, my + mh);
+      g.lineTo(mx + mw * 0.08, my);
+      g.lineTo(mx + mw * 0.35, my + mh * 0.25);
+      g.lineTo(mx + mw * 0.7, my + mh * 0.25);
+      g.lineTo(mx + mw, my + mh);
+    }
+    g.stroke();
+    g.globalAlpha = 1;
+  }
+  for (const [cx0, cy0, cw, cap] of D.caps) {
+    const cy = cy0 + 4.75;
+    g.strokeStyle = D.frame;
+    g.lineWidth = 1.5;
+    if (fits(9.5)) {
+      font(9.5);
+      const tw = g.measureText(cap.toUpperCase()).width * 1.06;
+      g.beginPath();
+      g.moveTo(cx0, cy); g.lineTo(cx0 + cw / 2 - tw / 2 - 6, cy);
+      g.moveTo(cx0 + cw / 2 + tw / 2 + 6, cy); g.lineTo(cx0 + cw, cy);
+      g.stroke();
+      text(cap, cx0 + cw / 2, cy + 3.5, 9.5, D.silk, 'center', 0.06);
+    } else {
+      g.beginPath();
+      g.moveTo(cx0, cy); g.lineTo(cx0 + cw, cy);
+      g.stroke();
+    }
+  }
+
+  const at = (cx, cy, deg, r) => [cx + r * Math.sin(deg * Math.PI / 180), cy - r * Math.cos(deg * Math.PI / 180)];
+  const V = D.values, SW = D.switches;
+  for (const [kx, ky, label, init, flags, param] of D.knobs) {
+    const value = V && param >= 0 && V[param] !== undefined ? V[param] : init;
+    const cx = kx + 32, cy = ky + 28, amber = flags.includes('a'), bi = flags.includes('b'), sel = flags.includes('s');
+    const n = sel ? D.lfoShapes.length : 11;
+    g.strokeStyle = D.silk;
+    g.lineWidth = 0.8;
+    g.beginPath();
+    for (let i = 0; i < n; i++) {
+      const a = -135 + i * 270 / (n - 1), major = sel || i % 2 === 0 || (bi && i === 5);
+      const [x0, y0] = at(cx, cy, a, 16.4), [x1, y1] = at(cx, cy, a, major ? 20 : 18.4);
+      g.moveTo(x0, y0);
+      g.lineTo(x1, y1);
+    }
+    g.stroke();
+    if (fits(sel ? 5 : 5.6)) {
+      for (let i = 0; i < n; i++) {
+        const s = sel ? D.lfoShapes[i] : bi ? { 0: '−5', 5: '0', 10: '+5' }[i] : i % 2 ? null : String(i);
+        if (!s) continue;
+        const [tx, ty] = at(cx, cy, -135 + i * 270 / (n - 1), sel ? 25.2 : 24.4);
+        font(sel ? 5 : 5.6, 700);
+        g.fillStyle = sel && i === Math.round(value * (n - 1)) ? D.red : D.silk;
+        g.textAlign = 'center';
+        g.fillText(s, tx, ty + 2);
+      }
+    }
+    g.beginPath();
+    g.arc(cx, cy, 13.6, 0, 2 * Math.PI);
+    g.fillStyle = amber ? '#3a2606' : '#070708';
+    g.fill();
+    g.setLineDash([1.04, 1]);
+    g.strokeStyle = amber ? '#e39a1c' : '#35353a';
+    g.lineWidth = 2.4;
+    g.stroke();
+    g.setLineDash([]);
+    const cap = g.createRadialGradient(cx - 1.7, cy - 3.3, 0, cx - 1.7, cy - 3.3, 14.5);
+    cap.addColorStop(0, amber ? '#ffd27a' : '#2e2e31');
+    cap.addColorStop(1, amber ? '#c97a08' : '#09090a');
+    g.beginPath();
+    g.arc(cx, cy, 10.4, 0, 2 * Math.PI);
+    g.fillStyle = cap;
+    g.fill();
+    g.strokeStyle = '#000';
+    g.lineWidth = 0.5;
+    g.stroke();
+    const deg = -135 + value * 270;
+    const [px0, py0] = at(cx, cy, deg, 4), [px1, py1] = at(cx, cy, deg, 12.4);
+    g.strokeStyle = amber ? '#140c00' : '#fff';
+    g.lineWidth = 1.9;
+    g.lineCap = 'round';
+    g.beginPath();
+    g.moveTo(px0, py0);
+    g.lineTo(px1, py1);
+    g.stroke();
+    if (fits(9)) {
+      const lines = label.length > 13 ? label.split(' ') : [label];
+      lines.forEach((s, i) => text(s, cx, ky + 59 + i * 10.4, 9, D.silk));
+    }
+  }
+
+  const slot = (sx, sy, sh, on) => {
+    const grad = g.createLinearGradient(sx, 0, sx + 14, 0);
+    grad.addColorStop(0, '#000'); grad.addColorStop(0.5, '#1c1c1f'); grad.addColorStop(1, '#000');
+    g.fillStyle = grad;
+    g.beginPath();
+    g.roundRect(sx, sy, 14, sh, 3);
+    g.fill();
+    g.strokeStyle = '#45454a';
+    g.lineWidth = 1;
+    g.stroke();
+    const bat = g.createLinearGradient(0, on, 0, on + 13);
+    bat.addColorStop(0, '#fbfbf7'); bat.addColorStop(0.8, '#b9b9b3'); bat.addColorStop(1, '#8d8d88');
+    g.fillStyle = bat;
+    g.beginPath();
+    g.roundRect(sx + 1, on, 12, 13, 2);
+    g.fill();
+  };
+  for (const [lx, ly, top, bottom, init, sw] of D.levers) {
+    const on = SW ? !!SW[sw] : init;
+    slot(lx, ly, 30, ly + (on ? 1 : 14));
+    if (D.waves[top]) {
+      g.save();
+      g.translate(lx + 7 - 12, ly - 16);
+      g.scale(24 / 22, 13 / 14);
+      g.strokeStyle = D.silk;
+      g.lineWidth = 1.6;
+      g.stroke(new Path2D(D.waves[top]));
+      g.restore();
+    } else if (fits(9)) text(top, lx + 7, ly - 4, 9, D.silk);
+    if (bottom && fits(9)) text(bottom, lx + 7, ly + 40, 9, D.silk);
+  }
+  const T = D.tracking, track = SW ? (SW[T.full] ? 0 : SW[T.half] ? 1 : 2) : 0;
+  slot(T.x, T.y, 40, T.y + 1 + track * 12);
+  if (fits(9)) {
+    T.names.forEach((s, i) => text(s, T.x + 20, T.y + 8 + i * 15.5, 9, i === track ? D.red : D.silk, 'left'));
+    text(T.label[2], T.label[0], T.label[1] + 10, 9.5, D.silk);
+  }
+
+  text('PRO-8000', 701, 76, 30, D.silk, 'left', 0.14);
+  if (fits(10)) {
+    text('Analog 8-voice polyphonic synthesizer', 701, 45, 10, D.silk, 'left', 0.14);
+    text('Custom firmware', 701, 92, 10, '#8a8a85', 'left', 0.14);
+    text('Power', 1270.7, 349, 9.5, D.silk);
+  }
+  g.beginPath();
+  g.arc(1270.7, 329.6, 5.5, 0, 2 * Math.PI);
+  g.fillStyle = '#3a1410';
+  g.fill();
+  g.restore();
+}
+
+// Devices with a look of their own, by the name of the port the chain's MIDI goes to.
+const DEVICE_LOOKS = [{ test: PRO800.port, ratio: PRO800.w / PRO800.h, draw: drawPro800, read: readPro800, changed: pro800Changed }];
+function chainLook(chain) {
+  const d = chain && dests.get(chain.dst);
+  return (d && DEVICE_LOOKS.find((l) => l.test.test(d.name))) || null;
+}
+
+// The synth and the screen, stacked at the right: the screen at the largest whole scale that still
+// leaves a second of rise for the note trails, the synth as wide as the room above allows. If the
+// synth would come out narrower than the screen, the screen gives way a step.
+function layoutViewStack(S, y, limit, look) {
+  if (!move.frame) return null;
+  const captionH = S.tag * 1.4 + 10, drop = S.label * 3.4;
+  for (let s = S.screen; s >= 2; s--) {
+    const w = 128 * s, h = 64 * s, x = VIEW_W - VIEW_M - w;
+    if (look) {
+      const fw = Math.min(VIEW_W - 2 * VIEW_M, (limit - S.rise - (y + drop + h + captionH)) * look.ratio);
+      if (fw < w * 1.1) continue;
+      const face = { x: VIEW_W - VIEW_M - fw, y, w: fw, h: fw / look.ratio, look };
+      const screen = { x, y: y + face.h + drop, w, h };
+      return { face, screen, bottom: screen.y + h + captionH };
+    }
+    if (limit - (y + h + captionH) >= S.rise) return { face: null, screen: { x, y, w, h }, bottom: y + h + captionH };
+  }
+  return look ? layoutViewStack(S, y, limit, null) : null;
+}
+
+// The audio cable, from the port the MIDI goes to down to the top of the screen.
+function pipeTo(S, from, screen, midi) {
+  return {
+    x: from.x, y: from.y,
+    toX: Math.min(screen.x + screen.w - S.label, Math.max(screen.x + S.label, from.x)), toY: screen.y,
+    midi,
+  };
+}
+
+function drawViewScreen(g, S, L, now) {
+  const B = L.screen;
+  if (!B) return;
+  const P = L.pipe, F = L.face, T = L.stub;
+  const level = meterPos(Math.max(rec.shown[0], rec.shown[1]));
+  if (F) {
+    // The MIDI going on into the synth lights with its route.
+    if (T) {
+      g.lineCap = 'round';
+      g.lineWidth = S.label * 0.14;
+      g.strokeStyle = VIEW_COLORS.idle;
+      g.beginPath();
+      g.moveTo(T.x, T.y);
+      g.lineTo(T.toX, T.toY);
+      g.stroke();
+      const glow = T.midi ? viewGlow(T.midi.rk, now) : 0;
+      if (glow) {
+        g.globalAlpha = glow;
+        g.strokeStyle = T.midi.color;
+        g.stroke();
+        g.globalAlpha = 1;
+      }
+    }
+    F.look.draw(g, F.x, F.y, F.w);
+  }
+  if (P) {
+    const bend = (P.toY - P.y) / 2;
+    const path = () => {
+      g.beginPath();
+      g.moveTo(P.x, P.y);
+      g.bezierCurveTo(P.x, P.y + bend, P.toX, P.toY - bend, P.toX, P.toY);
+    };
+    g.lineCap = 'round';
+    g.lineWidth = S.label * 0.14;
+    g.strokeStyle = VIEW_COLORS.idle;
+    path();
+    g.stroke();
+    if (level) {
+      g.globalAlpha = level;
+      g.strokeStyle = VIEW_COLORS.audio;
+      path();
+      g.stroke();
+      // Dots run down the cable for as long as there's sound.
+      g.fillStyle = '#ffffff';
+      for (let i = 0; i < 3; i++) {
+        const t = (now / 900 + i / 3) % 1, u = 1 - t;
+        const x = u * u * u * P.x + 3 * u * u * t * P.x + 3 * u * t * t * P.toX + t * t * t * P.toX;
+        const y = u * u * u * P.y + 3 * u * u * t * (P.y + bend) + 3 * u * t * t * (P.toY - bend) + t * t * t * P.toY;
+        g.beginPath();
+        g.arc(x, y, S.label * 0.18, 0, 2 * Math.PI);
+        g.fill();
+      }
+      g.globalAlpha = 1;
+    }
+    g.font = `500 ${S.tag}px system-ui, sans-serif`;
+    g.textBaseline = 'middle';
+    g.textAlign = 'right';
+    g.fillStyle = VIEW_COLORS.audio;
+    g.fillText('audio', Math.min(P.x, P.toX) - S.label * 0.6, P.y + bend);
+    if (P.midi) {
+      g.textAlign = 'center';
+      g.fillStyle = VIEW_COLORS.input;
+      g.fillText('MIDI', (P.midi.a.x + P.midi.b.x) / 2, (P.midi.a.y + P.midi.b.y) / 2 - S.label * 0.7);
+    }
+    g.textAlign = 'left';
+  }
+  g.fillStyle = '#000000';
+  g.fillRect(B.x, B.y, B.w, B.h);
+  g.imageSmoothingEnabled = false;
+  g.drawImage(move.screen, B.x, B.y, B.w, B.h);
+  g.imageSmoothingEnabled = true;
+  g.lineWidth = 2;
+  g.strokeStyle = P ? VIEW_COLORS.audio : VIEW_COLORS.idle;
+  g.globalAlpha = P ? 0.35 + 0.65 * level : 1;
+  g.strokeRect(B.x - 1, B.y - 1, B.w + 2, B.h + 2);
+  g.globalAlpha = 1;
+  if (!move.frame) return;
+  g.font = `500 ${S.tag}px system-ui, sans-serif`;
+  g.textBaseline = 'alphabetic';
+  g.fillStyle = VIEW_COLORS.muted;
+  g.fillText(move.lineIn ? 'Move · Line In on slot 2' : 'Move', B.x, B.y + B.h + S.tag * 1.4);
 }
 
 function drawViewCables(g, S, L, now) {
@@ -2380,9 +2854,10 @@ function drawViewCables(g, S, L, now) {
   g.globalAlpha = 1;
 
   // Pulses take 500 ms to cross.
-  view.pulses = view.pulses.filter((p) => now - p.at < 500 && L.byRk.has(p.rk));
+  view.pulses = view.pulses.filter((p) => now - p.at < 500);
   for (const p of view.pulses) {
     const c = L.byRk.get(p.rk);
+    if (!c) continue;
     const t = (now - p.at) / 500, u = 1 - t;
     const x = u * u * u * c.a.x + 3 * u * u * t * c.c1x + 3 * u * t * t * c.c2x + t * t * t * c.b.x;
     const y = u * u * u * c.a.y + 3 * u * u * t * c.a.y + 3 * u * t * t * c.b.y + t * t * t * c.b.y;
@@ -2412,10 +2887,84 @@ function drawViewCables(g, S, L, now) {
     g.fillText(n.text, n.x + dx, n.y);
     g.globalAlpha = 1;
   };
-  for (const n of L.left.values()) node(n, 's:' + n.p.key, viewColor(n.p), 'right', -22);
-  for (const n of L.right.values()) node(n, 'd:' + n.p.key, VIEW_COLORS.keyboard, 'left', 22);
+  for (const n of L.left.values()) node(n, 's:' + n.p.key, viewColor(n.p), 'right', -S.label * 0.85);
+  for (const n of L.right.values()) node(n, 'd:' + n.p.key, VIEW_COLORS.keyboard, 'left', S.label * 0.85);
   g.textAlign = 'left';
 }
+
+// The panel on the page: the chain's one route, the audio cable and the screen, in the video's
+// style. Whole device pixels keep the screen crisp at any zoom.
+function buildPanelLayout(g, S, W, dpr) {
+  const chain = moveChain();
+  const fit = Math.floor((W - 2 * PANEL_M) * dpr / 128);
+  const scale = Math.max(2, Math.min(Math.round(S.screen * dpr), fit)) / dpr;
+  const snap = (v) => Math.round(v * dpr) / dpr;
+  const w = 128 * scale, h = 64 * scale;
+  const width = chain ? W : w + 2 * PANEL_M;
+  const left = new Map(), right = new Map();
+  let cables = [], y = PANEL_M;
+  if (chain) {
+    const s = sources.get(chain.src), d = dests.get(chain.dst);
+    const names = viewNames([s, d]);
+    const label = (p) => (p.kind === 'kb' ? 'Keyboard' : names.get(p.name) || p.name);
+    g.font = `500 ${S.label}px system-ui, sans-serif`;
+    const gap = S.label * 0.85;
+    const leftW = Math.min(W * 0.45, g.measureText(label(s)).width), rightW = Math.min(W * 0.3, g.measureText(label(d)).width);
+    const lx = PANEL_M + leftW + gap, rx = W - PANEL_M - rightW - gap, ry = PANEL_M + S.label * 0.6;
+    const a = { p: s, x: lx, y: ry, text: fitText(g, label(s), leftW) };
+    const b = { p: d, x: rx, y: ry, text: fitText(g, label(d), rightW) };
+    left.set(s.key, a);
+    right.set(d.key, b);
+    const c = (rx - lx) * 0.5;
+    cables = [{ rk: chain.rk, color: viewColor(s), a, b, c1x: lx + c, c2x: rx - c }];
+    y = ry + S.label * 3.4;
+  }
+  const look = chainLook(chain);
+  const face = look ? { x: PANEL_M, y: snap(y), w: width - 2 * PANEL_M, h: (width - 2 * PANEL_M) / look.ratio, look } : null;
+  if (face) y = face.y + face.h + S.label * 3.4;
+  const screen = { x: snap(width - PANEL_M - w), y: snap(y), w, h };
+  screen.bottom = screen.y + h + S.tag * 1.4 + 4;
+  const stub = face ? pipeTo(S, right.get(chain.dst), face, cables[0]) : null;
+  const pipe = chain ? pipeTo(S, face ? { x: stub.toX, y: face.y + face.h } : right.get(chain.dst), screen, cables[0]) : null;
+  return { forRouting: routing, left, right, cables, byRk: new Map(cables.map((c) => [c.rk, c])), screen, face, stub, pipe, width, height: screen.bottom + PANEL_M };
+}
+
+const panel = { layout: null, raf: 0, dpr: 0, w: 0 };
+
+function schedulePanel() {
+  if (!panel.raf && move.schwung) panel.raf = requestAnimationFrame(drawPanel);
+}
+
+function drawPanel() {
+  panel.raf = 0;
+  if (!move.schwung) return;
+  const canvas = $('#move-view');
+  const g = canvas.getContext('2d');
+  const dpr = window.devicePixelRatio || 1;
+  const W = Math.min(PANEL_W, $('.bay').clientWidth || PANEL_W);
+  if (!panel.layout || panel.layout.forRouting !== routing || panel.dpr !== dpr || panel.w !== W) {
+    panel.layout = buildPanelLayout(g, PANEL_SHAPE, W, dpr);
+    panel.dpr = dpr;
+    panel.w = W;
+    canvas.width = Math.round(panel.layout.width * dpr);
+    canvas.height = Math.round(panel.layout.height * dpr);
+    canvas.style.width = panel.layout.width + 'px';
+    canvas.style.height = panel.layout.height + 'px';
+  }
+  const L = panel.layout;
+  const now = performance.now();
+  g.setTransform(dpr, 0, 0, dpr, 0, 0);
+  g.clearRect(0, 0, L.width, L.height);
+  drawViewScreen(g, PANEL_SHAPE, L, now);
+  if (L.cables.length) drawViewCables(g, PANEL_SHAPE, L, now);
+  else view.pulses = view.pulses.filter((p) => now - p.at < 500);
+  // It keeps going while there's something moving.
+  const level = L.pipe ? Math.max(rec.shown[0], rec.shown[1]) : 0;
+  const lit = [...view.active.values()].some((t) => now - t < 250);
+  if (level > 1e-4 || lit || view.pulses.length) schedulePanel();
+}
+
+new ResizeObserver(() => { panel.layout = null; schedulePanel(); }).observe($('.bay'));
 
 // A0 to C8, the range of a full piano, at a piano's proportions.
 const VIEW_LO = 21, VIEW_HI = 108;
@@ -2486,6 +3035,7 @@ function drawView() {
   const S = view.shape;
   const M = VIEW_M;
   const now = performance.now();
+  watchMoveStream();
   const keyTop = S.h - VIEW_KEY_H - M;
   const bandTop = keyTop - 18;
   g.fillStyle = VIEW_COLORS.bg;
@@ -2517,6 +3067,7 @@ function drawView() {
   const L = view.layout;
   updateViewTrails(now);
   drawViewTrails(g, S, L, keyTop, now);
+  drawViewScreen(g, S, L, now);
   drawViewCables(g, S, L, now);
   drawViewKeys(g, keyTop);
 }
@@ -2531,6 +3082,8 @@ async function startVideo() {
   updateRecUI();
   try {
     vid.ownsArm = !rec.stream;
+    const look = chainLook(moveChain());
+    if (look) look.read();
     if (!(await armRecorder())) throw Object.assign(new Error(''), { name: 'Reported' });
     const tracks = [...startView().getVideoTracks(), ...rec.mix.getAudioTracks()];
     vid.norm = !!rec.mix && state.recNorm && VIDEO_TYPES_OPUS.some((t) => MediaRecorder.isTypeSupported(t));
@@ -2686,6 +3239,263 @@ if (recSupported) navigator.mediaDevices.addEventListener('devicechange', refres
 window.addEventListener('beforeunload', (e) => {
   if (rec.take || vid.recorder || [...takes].some((t) => !t.saved)) e.preventDefault();
 });
+
+/* ---------- Move screen and sound (Schwung) ---------- */
+
+// A Move running Schwung serves its screen and sound on the network, for its own web mirror.
+// The WebSocket needs no permission, so it finds out whether Schwung is there before the
+// stream can make Chrome ask for local network access. Secure pages may reach move.local, but
+// only with that permission; localhost needs none.
+const MOVE_HOST = 'move.local';
+const MOVE_PORT = /ableton move/i;
+const MOVE_LINE_SLOT = 1;       // Schwung's slot 2
+const MOVE_RATE = 44100;
+const MOVE_JITTER = 0.2;        // seconds of sound held back against Wi-Fi hiccups
+const MOVE_RETRY_MS = 15000;
+const MOVE_SILENCE_MS = 6000;   // the server sends a heartbeat every 2 s
+
+const move = {
+  on: false,        // a Move port is present
+  ws: null, wsRetry: 0,
+  schwung: false,   // its WebSocket answered
+  lineIn: false,    // slot 2 holds Line In
+  stream: null,     // AbortController of the open stream
+  streamRetry: 0,
+  live: false,      // the stream is answering
+  lastEvent: 0,
+  blocked: false,   // the browser refused local network access
+  frame: false,     // a screen has been drawn
+  screen: Object.assign(document.createElement('canvas'), { width: 128, height: 64 }),
+  frames: [],       // {at, raw, gray} waiting for their sound to catch up
+  lead: 0,          // how far ahead the sound is scheduled, in seconds
+  audio: null,      // {ctx, dest, next, expect}
+  img: null,
+};
+
+function updateMovePresence() {
+  const here = [...sources.values(), ...dests.values()].some((p) => MOVE_PORT.test(p.name));
+  if (here && !move.on) {
+    move.on = true;
+    openMoveSocket();
+  } else if (!here && move.on) {
+    // Like any source that goes away, this ends a recording that was using it.
+    if (move.audio && rec.stream) onRecSourceEnded();
+    move.on = false;
+    closeMoveAudio();
+    if (move.ws) { move.ws.onclose = null; move.ws.close(); }
+    move.ws = null;
+    clearTimeout(move.wsRetry);
+    closeMoveStream();
+    move.frames = [];
+    setMoveState({ schwung: false, lineIn: false, frame: false, blocked: false });
+  }
+}
+
+function setMoveState(next) {
+  const wasSchwung = move.schwung;
+  const moved = ('frame' in next && next.frame !== move.frame) || ('lineIn' in next && next.lineIn !== move.lineIn);
+  Object.assign(move, next);
+  if (moved) view.layout = panel.layout = null;
+  if (move.schwung !== wasSchwung) refreshRecSources();
+  $('#move-screen').hidden = !move.schwung;
+  // The caption is drawn with the screen; this is for before there is one.
+  const note = $('#move-note');
+  note.hidden = move.frame;
+  note.textContent = move.frame ? ''
+    : move.blocked
+      ? 'The browser is blocking local network access. Allow it in this site’s settings to see the Move’s screen.'
+      : 'Waiting for the Move’s screen. The browser may ask to allow local network access.';
+  schedulePanel();
+}
+
+function openMoveSocket() {
+  let ws;
+  try {
+    ws = new WebSocket(`ws://${MOVE_HOST}:7700/ws/remote-ui`);
+  } catch {
+    return;
+  }
+  move.ws = ws;
+  ws.onopen = () => ws.send(JSON.stringify({ type: 'subscribe', slot: MOVE_LINE_SLOT }));
+  ws.onmessage = (e) => {
+    // Parameter updates pass through here as well.
+    if (typeof e.data !== 'string' || !e.data.includes('"slot_info"')) return;
+    let info;
+    try { info = JSON.parse(e.data); } catch { return; }
+    if (info.type !== 'slot_info' || info.slot !== MOVE_LINE_SLOT) return;
+    const first = !move.schwung;
+    setMoveState({ schwung: true, lineIn: info.synth === 'linein' });
+    if (first) openMoveStream();
+  };
+  ws.onclose = () => {
+    move.ws = null;
+    if (move.on) move.wsRetry = setTimeout(openMoveSocket, MOVE_RETRY_MS);
+  };
+}
+
+function closeMoveStream() {
+  if (move.stream) move.stream.abort();
+  move.stream = null;
+  move.live = false;
+  clearTimeout(move.streamRetry);
+}
+
+// Bare, it's the screen alone. Sound is 240 KB/s of Wi-Fi, so it's only asked for while in use.
+async function openMoveStream() {
+  closeMoveStream();
+  const c = new AbortController();
+  move.stream = c;
+  if (move.audio) move.audio.expect = -1;
+  const path = move.audio ? '/stream-auto?v=2&audio=1' : '/stream-auto';
+  try {
+    // This waits for as long as the browser's permission prompt stays open.
+    const res = await fetch(`http://${MOVE_HOST}:7681${path}`, { signal: c.signal, cache: 'no-store', targetAddressSpace: 'local' });
+    if (!res.ok) throw new Error(res.status);
+    move.live = true;
+    move.lastEvent = performance.now();
+    setMoveState({ blocked: false });
+    const reader = res.body.pipeThrough(new TextDecoderStream()).getReader();
+    let buf = '';
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buf += value;
+      let end;
+      while ((end = buf.indexOf('\n\n')) >= 0) {
+        onMoveEvent(buf.slice(0, end));
+        buf = buf.slice(end + 2);
+      }
+    }
+  } catch {
+    if (c.signal.aborted) return;
+    let access = '';
+    try { access = (await navigator.permissions.query({ name: 'local-network-access' })).state; } catch {}
+    setMoveState({ blocked: access === 'denied' });
+  }
+  if (move.stream !== c) return;
+  move.live = false;
+  move.streamRetry = setTimeout(openMoveStream, 5000);
+}
+
+// A half-open link fires no error, so silence is what gives it away. Also called while
+// filming, because timers slow down in a background tab.
+function watchMoveStream() {
+  if (move.live && performance.now() - move.lastEvent > MOVE_SILENCE_MS) openMoveStream();
+}
+setInterval(watchMoveStream, 2000);
+
+function onMoveEvent(block) {
+  move.lastEvent = performance.now();
+  let type = 'message', data = '';
+  for (const line of block.split('\n')) {
+    if (line.startsWith('event: ')) type = line.slice(7);
+    else if (line.startsWith('data: ')) data = line.slice(6);
+  }
+  if (type === 'pcm') onMovePcm(data);
+  else if (type === 'message') onMoveFrame(data);
+  paintMoveScreen();
+}
+
+// They arrive together, but the sound waits in its buffer, so the screen waits with it. The
+// sound's events are what drain this, as a timer would stall in a background tab.
+function onMoveFrame(data) {
+  let p;
+  try { p = JSON.parse(data); } catch { return; }
+  if (!p.data) return;
+  move.frames.push({
+    at: performance.now() + (move.audio ? move.lead * 1000 : 0),
+    raw: atob(p.data),
+    gray: p.format === 'gray4' || p.format === 'gray4_packed',
+  });
+}
+
+function paintMoveScreen() {
+  const now = performance.now();
+  let f = null;
+  while (move.frames.length && move.frames[0].at <= now) f = move.frames.shift();
+  if (!f) return;
+  const g = move.screen.getContext('2d');
+  if (!move.img) move.img = g.createImageData(128, 64);
+  const d = move.img.data;
+  for (let y = 0; y < 64; y++) {
+    for (let x = 0; x < 128; x++) {
+      // Packed by pages: eight rows to a byte, the lowest bit on top. Gray is 4 bits a pixel.
+      const v = f.gray
+        ? (f.raw.charCodeAt(y * 64 + (x >> 1)) >> (x & 1 ? 0 : 4) & 15) * 17
+        : (f.raw.charCodeAt((y >> 3) * 128 + x) >> (y & 7) & 1) * 255;
+      const i = (y * 128 + x) * 4;
+      d[i] = d[i + 1] = d[i + 2] = v;
+      d[i + 3] = 255;
+    }
+  }
+  g.putImageData(move.img, 0, 0);
+  if (!move.frame) setMoveState({ frame: true });
+  else schedulePanel();
+}
+
+async function openMoveAudio() {
+  if (!move.frame) throw Object.assign(new Error('The Move’s stream isn’t connected yet.'), { name: 'NoAudio' });
+  const ctx = new AudioContext({ sampleRate: MOVE_RATE, latencyHint: 'playback' });
+  await ctx.resume();
+  const dest = ctx.createMediaStreamDestination();
+  move.audio = { ctx, dest, next: 0, expect: -1 };
+  openMoveStream();
+  return dest.stream;
+}
+
+function closeMoveAudio() {
+  if (!move.audio) return;
+  move.audio.ctx.close().catch(() => {});
+  move.audio = null;
+  move.lead = 0;
+  if (move.on && move.schwung) openMoveStream();
+}
+
+// 16-bit stereo. `pos` counts the device's frames, so a gap is left as silence where it belongs.
+function onMovePcm(data) {
+  const a = move.audio;
+  if (!a) return;
+  let p;
+  try { p = JSON.parse(data); } catch { return; }
+  const raw = atob(p.d || ''), n = raw.length >> 2;
+  if (!n) return;
+  const rate = p.rate || MOVE_RATE;
+  const now = a.ctx.currentTime;
+  if (a.expect >= 0 && p.pos !== a.expect) {
+    const gap = p.pos - a.expect;
+    a.next = gap > 0 && gap < rate / 2 ? a.next + gap / rate : 0;
+  }
+  a.expect = p.pos + n;
+  if (a.next < now + 0.01 || a.next > now + MOVE_JITTER + 0.3) a.next = now + MOVE_JITTER;
+  const buf = a.ctx.createBuffer(2, n, rate);
+  const L = buf.getChannelData(0), R = buf.getChannelData(1);
+  for (let i = 0, o = 0; i < n; i++, o += 4) {
+    L[i] = ((raw.charCodeAt(o) | raw.charCodeAt(o + 1) << 8) << 16 >> 16) / 32768;
+    R[i] = ((raw.charCodeAt(o + 2) | raw.charCodeAt(o + 3) << 8) << 16 >> 16) / 32768;
+  }
+  const src = a.ctx.createBufferSource();
+  src.buffer = buf;
+  src.connect(a.dest);
+  src.start(a.next);
+  const ahead = a.next - now;
+  move.lead = move.lead ? move.lead + (ahead - move.lead) * 0.1 : ahead;
+  a.next += n / rate;
+}
+
+// Where Move's MIDI goes while slot 2 brings the audio back: a route from a Move port to any
+// port of another device.
+function moveChain() {
+  if (!move.lineIn) return null;
+  for (const [src, list] of routing) {
+    const s = sources.get(src);
+    if (!s || !MOVE_PORT.test(s.name)) continue;
+    for (const r of list) {
+      const d = dests.get(r.dst);
+      if (r.dst !== MON && d && !MOVE_PORT.test(d.name)) return { rk: r.rk, src, dst: r.dst };
+    }
+  }
+  return null;
+}
 
 /* ---------- boot ---------- */
 
