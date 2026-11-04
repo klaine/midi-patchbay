@@ -978,9 +978,12 @@ function deliver(dst, data, src) {
   const d = dests.get(dst);
   // Nothing goes to a port on its way out: the browser is still closing it.
   if (!d || d.port.state !== 'connected') return;
-  if ((data[0] & 0xF0) === 0xC0) {
-    const look = DEVICE_LOOKS.find((l) => l.test.test(d.name));
-    if (look) look.changed();
+  // A device with a look of its own follows its program changes and its knobs' controllers.
+  const st = data[0] & 0xF0;
+  if (st === 0xC0 || st === 0xB0) {
+    if (d.look === undefined) d.look = DEVICE_LOOKS.find((l) => l.test.test(d.name)) || null;
+    if (d.look && st === 0xC0) d.look.changed();
+    else if (d.look) d.look.cc(data[1], data[2], src && sources.has(src) ? viewColor(sources.get(src)) : VIEW_COLORS.input);
   }
   try {
     d.port.send(data);
@@ -2416,37 +2419,41 @@ function buildViewLayout(g, S, top, keyBandTop) {
   dsts = order(dsts, srcs, (r) => [r.dst, srcOf.get(r.rk)]);
   const sortedSrcs = order(srcs, dsts, (r) => [srcOf.get(r.rk), r.dst]);
   // The piped port goes last in its column, so the cable down to the screen crosses no other.
-  const chain = moveChain();
+  const chain = moveChain(), look = chainLook(chain);
   if (chain) dsts = [...dsts.filter((d) => d.key !== chain.dst), ...dsts.filter((d) => d.key === chain.dst)];
 
-  const rows = Math.max(sortedSrcs.length, dsts.length);
   const room = keyBandTop - top;
-  const height = Math.min(rows * S.rowH, room * 0.55);
-  const rowH = rows ? height / rows : 0;
   const names = viewNames([...sortedSrcs, ...dsts]);
   const label = (p) => (p.kind === 'kb' ? 'Keyboard' : names.get(p.name) || p.name);
   g.font = `500 ${S.label}px system-ui, sans-serif`;
   const W = VIEW_W - 2 * VIEW_M;
   const widest = (list, cap) => Math.min(cap, Math.max(0, ...list.map((p) => g.measureText(label(p)).width)));
-  const leftW = widest(sortedSrcs, W * 0.38), rightW = widest(dsts, W * 0.32);
   const gap = S.label * 0.85;
-  const lx = VIEW_M + leftW + gap, rx = VIEW_W - VIEW_M - rightW - gap;
-  const place = (list, x) => new Map(list.map((p, i) => [p.key, {
-    p, x, y: top + height / 2 + (i - (list.length - 1) / 2) * rowH, text: fitText(g, label(p), x === lx ? leftW : rightW),
-  }]));
-  const left = place(sortedSrcs, lx), right = place(dsts, rx);
-  const cables = routes.map((r) => {
-    const a = left.get(srcOf.get(r.rk)), b = right.get(r.dst);
-    const c = (rx - lx) * 0.5;
-    return { rk: r.rk, color: viewColor(a.p), a, b, c1x: a.x + c, c2x: b.x - c };
-  });
-  const stack = layoutViewStack(S, top + height + (rows ? S.rowH * 0.75 : 0), keyBandTop, chainLook(chain));
+  // The rows, then the stack under them. With the synth's own plate in the stack, its name leaves
+  // the rows and its cables plug into the plate instead.
+  const lay = (plated) => {
+    const shown = plated ? dsts.filter((d) => d.key !== chain.dst) : dsts;
+    const rows = Math.max(sortedSrcs.length, shown.length);
+    const height = Math.min(rows * S.rowH, room * 0.55);
+    const rowH = rows ? height / rows : 0;
+    const leftW = widest(sortedSrcs, W * 0.38), rightW = widest(shown, W * 0.32);
+    const lx = VIEW_M + leftW + gap, rx = VIEW_W - VIEW_M - rightW - gap;
+    const place = (list, x) => new Map(list.map((p, i) => [p.key, {
+      p, x, y: top + height / 2 + (i - (list.length - 1) / 2) * rowH, text: fitText(g, label(p), x === lx ? leftW : rightW),
+    }]));
+    const left = place(sortedSrcs, lx), right = place(shown, rx);
+    const stack = layoutViewStack(S, top + height + (rows ? S.rowH * 0.75 : 0), keyBandTop, plated ? look : null);
+    if (plated && !(stack && stack.face)) return null;
+    if (plated) right.set(chain.dst, plugNode(S, dests.get(chain.dst), stack.face, rx));
+    return { left, right, rows, height, stack };
+  };
+  const { left, right, rows, height, stack } = (look && lay(true)) || lay(false);
+  const cables = routes.map((r) => cable(r.rk, left.get(srcOf.get(r.rk)), right.get(r.dst)));
   const screen = stack && stack.screen, face = stack && stack.face;
-  let pipe = null, stub = null;
+  let pipe = null;
   if (chain && screen) {
-    const midi = cables.find((c) => c.rk === chain.rk);
-    if (face) stub = pipeTo(S, right.get(chain.dst), face, midi);
-    pipe = pipeTo(S, face ? { x: stub.toX, y: face.y + face.h } : right.get(chain.dst), screen, midi, S.label * 0.6);
+    const plug = right.get(chain.dst);
+    pipe = pipeTo(S, face ? { x: plug.x, y: face.y + face.h } : plug, screen, cables.find((c) => c.rk === chain.rk), S.label * 0.6);
   }
   const fades = (zTop) => {
     const fade = (color) => {
@@ -2467,8 +2474,29 @@ function buildViewLayout(g, S, top, keyBandTop) {
   }
   return {
     forRouting: routing, left, right, cables, byRk: new Map(cables.map((c) => [c.rk, c])),
-    screen, face, stub, pipe, zones,
+    screen, face, pipe, zones,
   };
+}
+
+// A cable between two nodes: level across the columns, or, into a plug on a plate, coming down
+// from above.
+function cable(rk, a, b) {
+  const c = (b.x - a.x) * 0.5;
+  return b.plug
+    ? { rk, color: viewColor(a.p), a, b, c1x: a.x + c, c1y: a.y, c2x: b.x, c2y: b.y - (b.y - a.y) * 0.5 }
+    : { rk, color: viewColor(a.p), a, b, c1x: a.x + c, c1y: a.y, c2x: b.x - c, c2y: b.y };
+}
+function cablePath(g, c) {
+  g.beginPath();
+  g.moveTo(c.a.x, c.a.y);
+  g.bezierCurveTo(c.c1x, c.c1y, c.c2x, c.c2y, c.b.x, c.b.y);
+}
+function cableAt(c, t) {
+  return [cubic(c.a.x, c.c1x, c.c2x, c.b.x, t), cubic(c.a.y, c.c1y, c.c2y, c.b.y, t)];
+}
+// Where a plate's cables plug in: on its top edge, under the column its name would be in.
+function plugNode(S, p, face, x) {
+  return { p, x: Math.min(face.x + face.w - 2 * S.label, Math.max(face.x + 2 * S.label, x)), y: face.y, text: '', plug: true };
 }
 
 // The PRO 8000's faceplate as its editor draws it (tools/web in the pro-8000 repository), in that
@@ -2507,12 +2535,15 @@ const PRO800 = {
   caps: [[134, 94, 110, 'Shape'], [168, 235.6, 110, 'Shape'], [64.9, 361.1, 140, 'Source amount'], [290.7, 361.1, 100.7, 'Destination'], [403.9, 501.5, 133.4, 'Destination'], [702, 380.2, 489.5, 'Filter envelope']],
   header: [0xF0, 0x00, 0x20, 0x32, 0x00, 0x01, 0x24, 0x00],
   port: /pro.?8000?/i,
-  values: null,     // the knobs, 0-1, as last read from the synth
+  values: null,     // the knobs, 0-1, as last read from the synth or set over MIDI
   switches: null,   // the panel switches, as last read
-  rev: 0,           // bumped by each reading, so the painted plate knows it's stale
+  rev: 0,           // bumped by each change, so a painted plate knows it's stale
+  live: null,       // the knob last set over MIDI: {param, value, color, at}
   waiters: [],
   reread: 0,
-  cache: { key: '', canvas: null },
+  cache: new Map(), // plates painted, by width in device pixels
+  // The knob each controller sets, from the firmware's table (src/main.c, cc_map).
+  cc: { 14: 10, 15: 11, 16: 12, 17: 13, 18: 14, 19: 15, 20: 21, 21: 25, 74: 24, 71: 8, 22: 9, 23: 7, 24: 6, 25: 5, 26: 4, 73: 3, 75: 2, 70: 1, 72: 0, 5: 16, 76: 17, 77: 18, 29: 23, 30: 22, 31: 19 },
 };
 
 // The synth's own settings, read once over SysEx with the editor's read-only requests (`0x53 layer`
@@ -2580,19 +2611,66 @@ function pro800Changed() {
   PRO800.reread = setTimeout(readPro800, 400);
 }
 
-// Draws the plate w wide at (x, y). It only changes with a reading or a size, so it's painted
-// into a canvas of its own at the device's resolution and blitted from there each frame.
+// A controller through here turns its knob on the plate and names it with the value for a moment,
+// as the synth's display does. The synth reports nothing when its own knobs turn (its firmware
+// only does in the editor's panel-mapping mode, where a knob is reported instead of acted on), so
+// those stay where the last reading put them.
+const PRO800_SHOW_MS = 1500;
+function pro800Cc(cc, value, color) {
+  const param = PRO800.cc[cc];
+  if (param === undefined) return;
+  if (!PRO800.values) PRO800.values = [];
+  PRO800.values[param] = value / 127;
+  PRO800.rev++;
+  PRO800.live = { param, value, color, at: performance.now() };
+  schedulePanel();
+}
+function pro800Busy(now) {
+  return !!PRO800.live && now - PRO800.live.at < PRO800_SHOW_MS;
+}
+function drawPro800Live(g, S, F, now) {
+  const D = PRO800, live = D.live;
+  if (!live || now - live.at >= PRO800_SHOW_MS) return;
+  const knob = D.knobs.find((kn) => kn[5] === live.param);
+  if (!knob) return;
+  const [kx, ky, label] = knob, k = F.w / D.w;
+  const cx = F.x + (kx + 32) * k, cy = F.y + (ky + 28) * k, r = 29 * k;
+  const section = D.sections.find(([sx, sy, sw, sh, title]) => title && kx >= sx && kx < sx + sw && ky >= sy && ky < sy + sh);
+  const text = `${section ? section[4] + ' · ' : ''}${label}  ${live.value}`;
+  g.globalAlpha = Math.min(1, (PRO800_SHOW_MS - (now - live.at)) / 300);
+  g.strokeStyle = live.color;
+  g.lineWidth = Math.max(1.5, S.label * 0.1);
+  g.beginPath();
+  g.arc(cx, cy, r, 0, 2 * Math.PI);
+  g.stroke();
+  // The tag sits beside the knob, on whichever side has the room.
+  g.font = `500 ${S.tag}px system-ui, sans-serif`;
+  const w = g.measureText(text).width + S.tag * 1.2, dx = r + S.tag * 0.4 + w / 2;
+  drawPill(g, S, text, cx + dx + w / 2 <= F.x + F.w - 4 ? cx + dx : cx - dx, cy, VIEW_COLORS.text, live.color);
+  g.globalAlpha = 1;
+}
+
+// Draws the plate w wide at (x, y). It only changes with a knob or a size, so it's painted into a
+// canvas of its own at the device's resolution and blitted from there each frame. One canvas per
+// size, so the panel and a video don't keep repainting over each other.
 function drawPro800(g, x, y, w) {
   const D = PRO800, px = g.getTransform().a || 1;
-  const pw = Math.round(w * px), key = `${pw}|${D.rev}`;
-  if (D.cache.key !== key) {
-    const c = D.cache.canvas || (D.cache.canvas = document.createElement('canvas'));
-    c.width = pw;
-    c.height = Math.round(pw * D.h / D.w);
-    paintPro800(c.getContext('2d'), pw, w / D.w);
-    D.cache.key = key;
+  const pw = Math.round(w * px);
+  let c = D.cache.get(pw);
+  if (!c) {
+    if (D.cache.size >= 3) D.cache.delete(D.cache.keys().next().value);
+    c = { rev: -1, canvas: document.createElement('canvas') };
+    c.canvas.width = pw;
+    c.canvas.height = Math.round(pw * D.h / D.w);
+    D.cache.set(pw, c);
   }
-  g.drawImage(D.cache.canvas, x, y, w, w * D.h / D.w);
+  if (c.rev !== D.rev) {
+    const cg = c.canvas.getContext('2d');
+    cg.clearRect(0, 0, c.canvas.width, c.canvas.height);
+    paintPro800(cg, pw, w / D.w);
+    c.rev = D.rev;
+  }
+  g.drawImage(c.canvas, x, y, w, w * D.h / D.w);
 }
 
 // Paints the plate w wide at the origin. `detail` is its scale in CSS pixels: small, it's drawn
@@ -2805,7 +2883,7 @@ function paintPro800(g, w, detail) {
 }
 
 // Devices with a look of their own, by the name of the port the chain's MIDI goes to.
-const DEVICE_LOOKS = [{ test: PRO800.port, ratio: PRO800.w / PRO800.h, draw: drawPro800, read: readPro800, changed: pro800Changed }];
+const DEVICE_LOOKS = [{ test: PRO800.port, ratio: PRO800.w / PRO800.h, draw: drawPro800, live: drawPro800Live, busy: pro800Busy, cc: pro800Cc, read: readPro800, changed: pro800Changed }];
 function chainLook(chain) {
   const d = chain && dests.get(chain.dst);
   return (d && DEVICE_LOOKS.find((l) => l.test.test(d.name))) || null;
@@ -2843,14 +2921,14 @@ function pipeTo(S, from, box, midi, pad = 0) {
 }
 
 // A label sitting on a cable.
-function drawPill(g, S, text, x, y, color) {
+function drawPill(g, S, text, x, y, color, edge = VIEW_COLORS.idle) {
   g.font = `500 ${S.tag}px system-ui, sans-serif`;
   const w = g.measureText(text).width + S.tag * 1.2, h = S.tag * 1.6;
   g.fillStyle = VIEW_COLORS.bg;
   g.beginPath();
   g.roundRect(x - w / 2, y - h / 2, w, h, h / 2);
   g.fill();
-  g.strokeStyle = VIEW_COLORS.idle;
+  g.strokeStyle = edge;
   g.lineWidth = 1;
   g.stroke();
   g.fillStyle = color;
@@ -2867,33 +2945,18 @@ function drawViewPills(g, S, L) {
   if (!P) return;
   drawPill(g, S, 'audio', (P.x + P.toX) / 2, (P.y + P.toY) / 2, VIEW_COLORS.audio);
   const c = P.midi;
-  if (c) drawPill(g, S, 'MIDI', cubic(c.a.x, c.c1x, c.c2x, c.b.x, 0.5), (c.a.y + c.b.y) / 2, VIEW_COLORS.input);
+  // On the level run of the cable, before it turns down into a plate.
+  if (c) drawPill(g, S, 'MIDI', ...cableAt(c, c.b.plug ? 0.3 : 0.5), VIEW_COLORS.input);
 }
 
 function drawViewScreen(g, S, L, now) {
   const B = L.screen;
   if (!B) return;
-  const P = L.pipe, F = L.face, T = L.stub;
+  const P = L.pipe, F = L.face;
   const level = meterPos(Math.max(rec.shown[0], rec.shown[1]));
   if (F) {
-    // The MIDI going on into the synth lights with its route.
-    if (T) {
-      g.lineCap = 'round';
-      g.lineWidth = S.label * 0.14;
-      g.strokeStyle = VIEW_COLORS.idle;
-      g.beginPath();
-      g.moveTo(T.x, T.y);
-      g.lineTo(T.toX, T.toY);
-      g.stroke();
-      const glow = T.midi ? viewGlow(T.midi.rk, now) : 0;
-      if (glow) {
-        g.globalAlpha = glow;
-        g.strokeStyle = T.midi.color;
-        g.stroke();
-        g.globalAlpha = 1;
-      }
-    }
     F.look.draw(g, F.x, F.y, F.w);
+    F.look.live(g, S, F, now);
   }
   if (P) {
     const bend = (P.toY - P.y) / 2;
@@ -2953,20 +3016,15 @@ function drawViewScreen(g, S, L, now) {
 
 function drawViewCables(g, S, L, now) {
   g.lineCap = 'round';
-  const path = (c) => {
-    g.beginPath();
-    g.moveTo(c.a.x, c.a.y);
-    g.bezierCurveTo(c.c1x, c.a.y, c.c2x, c.b.y, c.b.x, c.b.y);
-  };
   g.lineWidth = S.label * 0.1;
   g.strokeStyle = VIEW_COLORS.idle;
-  for (const c of L.cables) { path(c); g.stroke(); }
+  for (const c of L.cables) { cablePath(g, c); g.stroke(); }
   for (const c of L.cables) {
     const glow = viewGlow(c.rk, now);
     if (!glow) continue;
     g.globalAlpha = glow;
     g.strokeStyle = c.color;
-    path(c);
+    cablePath(g, c);
     g.stroke();
   }
   g.globalAlpha = 1;
@@ -2976,9 +3034,7 @@ function drawViewCables(g, S, L, now) {
   for (const p of view.pulses) {
     const c = L.byRk.get(p.rk);
     if (!c) continue;
-    const t = (now - p.at) / 500;
-    const x = cubic(c.a.x, c.c1x, c.c2x, c.b.x, t);
-    const y = cubic(c.a.y, c.a.y, c.b.y, c.b.y, t);
+    const [x, y] = cableAt(c, (now - p.at) / 500);
     g.fillStyle = '#ffffff';
     g.beginPath();
     g.arc(x, y, S.label * 0.2, 0, 2 * Math.PI);
@@ -2998,11 +3054,11 @@ function drawViewCables(g, S, L, now) {
       g.fillStyle = color;
       g.fill();
     }
-    // Dim names come up with their activity, so the eye goes to what's playing.
+    // Dim names come up with their activity, so the eye goes to what's playing. A plug has none.
     g.globalAlpha = 0.7 + 0.3 * glow;
     g.fillStyle = VIEW_COLORS.text;
     g.textAlign = align;
-    g.fillText(n.text, n.x + dx, n.y);
+    if (n.text) g.fillText(n.text, n.x + dx, n.y);
     g.globalAlpha = 1;
   };
   for (const n of L.left.values()) node(n, 's:' + n.p.key, viewColor(n.p), 'right', -S.label * 0.85);
@@ -3013,39 +3069,38 @@ function drawViewCables(g, S, L, now) {
 // The panel on the page: the chain's one route, the audio cable and the screen, in the video's
 // style. Whole device pixels keep the screen crisp at any zoom.
 function buildPanelLayout(g, S, W, dpr) {
-  const chain = moveChain();
+  const chain = moveChain(), look = chainLook(chain);
   const fit = Math.floor((W - 2 * PANEL_M) * dpr / 128);
   const scale = Math.max(2, Math.min(Math.round(S.screen * dpr), fit)) / dpr;
   const snap = (v) => Math.round(v * dpr) / dpr;
   const w = 128 * scale, h = 64 * scale;
   const width = chain ? W : w + 2 * PANEL_M;
   const left = new Map(), right = new Map();
-  let cables = [], y = PANEL_M;
+  let cables = [], face = null, y = PANEL_M;
   if (chain) {
     const s = sources.get(chain.src), d = dests.get(chain.dst);
     const names = viewNames([s, d]);
     const label = (p) => (p.kind === 'kb' ? 'Keyboard' : names.get(p.name) || p.name);
     g.font = `500 ${S.label}px system-ui, sans-serif`;
     const gap = S.label * 0.85;
-    const leftW = Math.min(W * 0.45, g.measureText(label(s)).width), rightW = Math.min(W * 0.3, g.measureText(label(d)).width);
+    const leftW = Math.min(W * 0.45, g.measureText(label(s)).width), rightW = look ? 0 : Math.min(W * 0.3, g.measureText(label(d)).width);
     const lx = PANEL_M + leftW + gap, rx = W - PANEL_M - rightW - gap, ry = PANEL_M + S.label * 0.6;
+    y = ry + S.label * 3.4;
+    // The synth's plate stands for it: its cable plugs into the plate, and its name stays off.
+    if (look) face = { x: PANEL_M, y: snap(y), w: W - 2 * PANEL_M, h: (W - 2 * PANEL_M) / look.ratio, look };
     const a = { p: s, x: lx, y: ry, text: fitText(g, label(s), leftW) };
-    const b = { p: d, x: rx, y: ry, text: fitText(g, label(d), rightW) };
+    const b = face ? plugNode(S, d, face, rx) : { p: d, x: rx, y: ry, text: fitText(g, label(d), rightW) };
     left.set(s.key, a);
     right.set(d.key, b);
-    const c = (rx - lx) * 0.5;
-    cables = [{ rk: chain.rk, color: viewColor(s), a, b, c1x: lx + c, c2x: rx - c }];
-    y = ry + S.label * 3.4;
+    cables = [cable(chain.rk, a, b)];
+    if (face) y = face.y + face.h + S.label * 3.4;
   }
-  const look = chainLook(chain);
-  const face = look ? { x: PANEL_M, y: snap(y), w: width - 2 * PANEL_M, h: (width - 2 * PANEL_M) / look.ratio, look } : null;
-  if (face) y = face.y + face.h + S.label * 3.4;
   const pad = S.label * 0.6;
   const screen = { x: snap(width - PANEL_M - w), y: snap(y + (chain ? 0 : pad)), w, h };
   screen.bottom = screen.y + h + pad + S.tag * 1.4 + 4;
-  const stub = face ? pipeTo(S, right.get(chain.dst), face, cables[0]) : null;
-  const pipe = chain ? pipeTo(S, face ? { x: stub.toX, y: face.y + face.h } : right.get(chain.dst), screen, cables[0], pad) : null;
-  return { forRouting: routing, left, right, cables, byRk: new Map(cables.map((c) => [c.rk, c])), screen, face, stub, pipe, width, height: screen.bottom + PANEL_M };
+  const plug = chain ? right.get(chain.dst) : null;
+  const pipe = chain ? pipeTo(S, face ? { x: plug.x, y: face.y + face.h } : plug, screen, cables[0], pad) : null;
+  return { forRouting: routing, left, right, cables, byRk: new Map(cables.map((c) => [c.rk, c])), screen, face, pipe, width, height: screen.bottom + PANEL_M };
 }
 
 const panel = { layout: null, raf: 0, dpr: 0, w: 0 };
@@ -3086,7 +3141,7 @@ function drawPanel() {
   // It keeps going while there's something moving.
   const level = L.pipe ? Math.max(rec.shown[0], rec.shown[1]) : 0;
   const lit = [...view.active.values()].some((t) => now - t < 250);
-  if (level > 1e-4 || lit || view.pulses.length) schedulePanel();
+  if (level > 1e-4 || lit || view.pulses.length || (L.face && L.face.look.busy(now))) schedulePanel();
 }
 
 new ResizeObserver(() => { panel.layout = null; schedulePanel(); }).observe($('.bay'));

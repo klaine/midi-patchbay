@@ -48,6 +48,11 @@ root of `main`.
   it shows the synth's own knobs and switches, read with the editor's read-only requests when the
   chain forms, when a video starts and after a program change; never polled. Keep those requests
   read-only. `layoutViewStack()` sizes the synth and the screen against the room the note trails need.
+  The plate stands for its port: the port's name leaves the rows and its cables plug into the plate's
+  top edge (`plugNode()`, `cable()`). A controller delivered to the synth turns the plate's knob by
+  the firmware's CC table (`PRO800.cc`) and names it with the value for a moment. The synth reports
+  nothing when its own knobs turn (its firmware only does in the editor's panel-mapping report mode,
+  which takes the knobs away from the sound), so those stay as last read.
 - Tab or system audio is a source for Record audio only. It's the one thing here that uses
   `getDisplayMedia`.
 - Test the recorder by replacing `getUserMedia` and `enumerateDevices` with mocks
