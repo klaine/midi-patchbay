@@ -596,10 +596,16 @@ function loadState() {
 let saveTimer = 0;
 function save() {
   clearTimeout(saveTimer);
-  saveTimer = setTimeout(() => {
-    try { localStorage.setItem(STORE, JSON.stringify(state)); } catch {}
-  }, 200);
+  saveTimer = setTimeout(saveNow, 200);
 }
+function saveNow() {
+  clearTimeout(saveTimer);
+  saveTimer = 0;
+  try { localStorage.setItem(STORE, JSON.stringify(state)); } catch {}
+}
+// A change made just before the tab closes would otherwise sit in the timer and be lost.
+window.addEventListener('pagehide', () => { if (saveTimer) saveNow(); });
+document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'hidden' && saveTimer) saveNow(); });
 
 const $ = (s) => document.querySelector(s);
 const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -701,17 +707,30 @@ function uniqueKeys(prefix, ports) {
 }
 
 function refresh() {
+  const ins = access ? uniqueKeys('in:', access.inputs.values()) : [];
+  const outs = access ? uniqueKeys('out:', access.outputs.values()) : [];
+  // An input that's gone will never send its note-offs, so its sounding notes are released
+  // now, while the outputs are still here. An output that's gone takes its held notes with it.
+  const inKeys = new Set(ins.map((s) => s.key)), outKeys = new Set(outs.map((d) => d.key));
+  for (const [src, list] of routing) {
+    for (const r of list) {
+      if (src !== KB && !inKeys.has(src)) releaseRoute(r.rk, r.dst);
+      else if (r.dst !== MON && !outKeys.has(r.dst)) r.held.clear();
+    }
+  }
   sources.clear();
   dests.clear();
   sources.set(KB, { key: KB, name: 'On-screen keyboard', kind: 'kb' });
   if (access) {
-    for (const s of uniqueKeys('in:', access.inputs.values())) {
+    // A port that's gone keeps nothing pointing back here.
+    for (const p of access.inputs.values()) if (p.state === 'disconnected') p.onmidimessage = null;
+    for (const s of ins) {
       s.kind = 'in';
       sources.set(s.key, s);
       const key = s.key;
       s.port.onmidimessage = (e) => onInput(key, e.data);
     }
-    for (const d of uniqueKeys('out:', access.outputs.values())) {
+    for (const d of outs) {
       d.kind = 'out';
       dests.set(d.key, d);
     }
@@ -758,8 +777,10 @@ function rebuildRouting() {
   $('#routes-count').textContent = connected ? `${connected} connected` : 'none connected';
   renderRoutes();
   schedulePanel();
-  const look = chainLook(moveChain());
-  if (look) look.read();
+  // The synth is asked about its settings when the chain forms, not on every rebuild.
+  const chain = moveChain(), look = chainLook(chain);
+  for (const l of DEVICE_LOOKS) if (l !== look) l.readFor = null;
+  if (look && look.readFor !== chain.rk && look.read()) look.readFor = chain.rk;
 }
 
 const outBuf = [];
@@ -822,7 +843,13 @@ function transform(d, r, out) {
       if (!c.notes) return;
       const n = d[1] + c.tr;
       if (n < 0 || n > 127) return;
-      if (type === 0x90 && d[2] > 0) r.held.set((ch << 7) | d[1], (oc << 7) | n);
+      if (type === 0x90 && d[2] > 0) {
+        // A key struck again while sounding: if its note now maps elsewhere, the old one is
+        // released first, or nothing would ever release it.
+        const hk = (ch << 7) | d[1], next = (oc << 7) | n, prev = r.held.get(hk);
+        if (prev !== undefined && prev !== next) out.push([0x80 | (prev >> 7), prev & 127, 0]);
+        r.held.set(hk, next);
+      }
       out.push([type | oc, n, type === 0x90 && d[2] > 0 ? vel : d[2]]);
       return;
     }
@@ -949,7 +976,8 @@ function deliver(dst, data, src) {
   flash('d:' + dst);
   if (dst === MON) { logMessage(src, data); return; }
   const d = dests.get(dst);
-  if (!d) return;
+  // Nothing goes to a port on its way out: the browser is still closing it.
+  if (!d || d.port.state !== 'connected') return;
   if ((data[0] & 0xF0) === 0xC0) {
     const look = DEVICE_LOOKS.find((l) => l.test.test(d.name));
     if (look) look.changed();
@@ -974,10 +1002,12 @@ function releaseRoute(rk, dst) {
 }
 
 function onInput(key, data) {
+  const s = sources.get(key);
+  if (!s) return;   // the port went away and this is its last word
   const st = data[0];
   const type = st & 0xF0;
   if (type === 0x90 || type === 0x80) markIncoming(data[1], type === 0x90 && data[2] > 0);
-  else if (st === 0xF0 && PRO800.port.test(sources.get(key).name)) onPro800Sysex(data);
+  else if (st === 0xF0 && PRO800.port.test(s.name)) onPro800Sysex(data);
   dispatch(key, data);
 }
 
@@ -986,7 +1016,7 @@ function panic() {
   for (const code of [...pressedCodes.keys()]) pressedCodes.delete(code);
   for (const [rk, held] of heldByRoute) held.clear();
   for (const d of dests.values()) {
-    if (d.kind !== 'out') continue;
+    if (d.kind !== 'out' || d.port.state !== 'connected') continue;
     for (let ch = 0; ch < 16; ch++) {
       try {
         d.port.send([0xB0 | ch, 64, 0]);
@@ -1003,14 +1033,29 @@ function panic() {
 
 /* ---------- activity LEDs ---------- */
 
+// A clock or a dense CC stream flashes hundreds of times a second, so an LED that's already lit
+// only has its time extended, and one timer puts them all out.
 let leds = new Map();
-const ledTimers = new Map();
+const litUntil = new Map();   // LED id -> when it goes dark
+let ledTimer = 0;
 function flash(id) {
   const els = leds.get(id);
   if (!els) return;
-  for (const el of els) el.classList.add('on');
-  clearTimeout(ledTimers.get(id));
-  ledTimers.set(id, setTimeout(() => { for (const el of els) el.classList.remove('on'); }, 70));
+  if (!litUntil.has(id)) for (const el of els) el.classList.add('on');
+  litUntil.set(id, performance.now() + 70);
+  if (!ledTimer) ledTimer = setTimeout(unflash, 70);
+}
+function unflash() {
+  ledTimer = 0;
+  const now = performance.now();
+  let next = Infinity;
+  for (const [id, until] of litUntil) {
+    if (until > now + 2) { next = Math.min(next, until); continue; }
+    litUntil.delete(id);
+    const els = leds.get(id);
+    if (els) for (const el of els) el.classList.remove('on');
+  }
+  if (next < Infinity) ledTimer = setTimeout(unflash, Math.max(10, next - now));
 }
 
 /* ---------- patch bay UI ---------- */
@@ -1042,6 +1087,7 @@ function renderMatrix() {
   h += '</tbody>';
   t.innerHTML = h;
   leds = new Map();
+  litUntil.clear();
   for (const el of t.querySelectorAll('[data-led]')) {
     const k = el.dataset.led;
     if (!leds.has(k)) leds.set(k, []);
@@ -1869,6 +1915,8 @@ async function armRecorder() {
     stream = await openRecSource(value);
     const track = stream.getAudioTracks()[0];
     if (!track) throw Object.assign(new Error('That share has no audio. Pick a tab or screen and turn on sharing its audio.'), { name: 'NoAudio' });
+    // The share's picture is never read, so its capture is stopped at once; the sound carries on.
+    if (value === TAB_SOURCE) for (const t of stream.getVideoTracks()) t.stop();
     const rate = recContextRate(value === MOVE_SOURCE ? MOVE_RATE : track.getSettings().sampleRate);
     ctx = new AudioContext(rate ? { sampleRate: rate, latencyHint: 'playback' } : { latencyHint: 'playback' });
     const url = URL.createObjectURL(new Blob([TAP_SRC], { type: 'text/javascript' }));
@@ -2249,8 +2297,8 @@ const VIEW_SHAPES = {
 };
 // The page's panel beside the patch bay, drawn by the same code.
 const PANEL_SHAPE = { label: 13, tag: 12, screen: 3 };
-const PANEL_W = 480, PANEL_M = 8;
-const VIEW_COLORS = { bg: '#101014', band: '#17151a', text: '#ecebe8', muted: '#9a968e', idle: '#3b3b44', keyboard: '#ff7a2e', input: '#7c95ff', audio: '#51cf8a' };
+const PANEL_W = 480, PANEL_M = 14;
+const VIEW_COLORS = { bg: '#101014', band: '#17151a', bezel: '#17171b', edge: '#2c2c33', text: '#ecebe8', muted: '#9a968e', idle: '#3b3b44', keyboard: '#ff7a2e', input: '#7c95ff', audio: '#51cf8a' };
 const view = {
   on: false, canvas: null, g: null, ticker: null, shape: VIEW_SHAPES.square,
   active: new Map(),   // route, source or destination -> time of its last message
@@ -2311,9 +2359,11 @@ function fitText(g, text, width) {
 
 // Shorter names for the video. Ports of one device share their leading words, so
 // "Ableton Move Live Port" and "Ableton Move User Port" become "Move Live" and "Move User".
+// Windows names a device's further ports "MIDIIN2 (Ableton Move MIDI)"; that becomes "Move 2".
 function viewNames(ports) {
   const words = new Map();
-  for (const p of ports) if (p.kind !== 'kb') words.set(p.name, p.name.split(' '));
+  const plain = (name) => name.replace(/^MIDI(?:IN|OUT)(\d+) \((.+?)(?: MIDI)?\)$/, '$2 $1');
+  for (const p of ports) if (p.kind !== 'kb') words.set(p.name, plain(p.name).split(' '));
   const out = new Map();
   for (const [name, w] of words) {
     const peers = [...words.values()].filter((o) => o[0] === w[0]);
@@ -2330,6 +2380,12 @@ function viewNames(ports) {
 }
 
 const viewColor = (s) => (s.kind === 'kb' ? VIEW_COLORS.keyboard : VIEW_COLORS.input);
+
+// A point along a cubic bezier, one axis at a time.
+function cubic(p0, p1, p2, p3, t) {
+  const u = 1 - t;
+  return u * u * u * p0 + 3 * u * u * t * p1 + 3 * u * t * t * p2 + t * t * t * p3;
+}
 
 // Only ports with a route take part. Each side is sorted by the mean position of what it
 // connects to, which keeps cables from crossing where they don't have to.
@@ -2384,24 +2440,34 @@ function buildViewLayout(g, S, top, keyBandTop) {
     const c = (rx - lx) * 0.5;
     return { rk: r.rk, color: viewColor(a.p), a, b, c1x: a.x + c, c2x: b.x - c };
   });
-  const stack = layoutViewStack(S, top + height + (rows ? S.rowH : 0), keyBandTop, chainLook(chain));
+  const stack = layoutViewStack(S, top + height + (rows ? S.rowH * 0.75 : 0), keyBandTop, chainLook(chain));
   const screen = stack && stack.screen, face = stack && stack.face;
-  const zoneTop = (stack ? stack.bottom : top + height) + (rows || stack ? 16 : 0);
   let pipe = null, stub = null;
   if (chain && screen) {
     const midi = cables.find((c) => c.rk === chain.rk);
     if (face) stub = pipeTo(S, right.get(chain.dst), face, midi);
-    pipe = pipeTo(S, face ? { x: stub.toX, y: face.y + face.h } : right.get(chain.dst), screen, midi);
+    pipe = pipeTo(S, face ? { x: stub.toX, y: face.y + face.h } : right.get(chain.dst), screen, midi, S.label * 0.6);
   }
-  const fade = (color) => {
-    const grad = g.createLinearGradient(0, zoneTop, 0, keyBandTop);
-    grad.addColorStop(0, color + '00');
-    grad.addColorStop(0.55, color + 'e6');
-    return grad;
+  const fades = (zTop) => {
+    const fade = (color) => {
+      const grad = g.createLinearGradient(0, zTop, 0, keyBandTop);
+      grad.addColorStop(0, color + '00');
+      grad.addColorStop(0.55, color + 'e6');
+      return grad;
+    };
+    return { [VIEW_COLORS.keyboard]: fade(VIEW_COLORS.keyboard), [VIEW_COLORS.input]: fade(VIEW_COLORS.input) };
   };
+  // The trails rise to the rows, except under the screen and the synth, where they stop below them.
+  const underRows = top + height + (rows ? 16 : 0);
+  const underStack = (stack ? stack.bottom : top + height) + (rows || stack ? 16 : 0);
+  const zones = [{ x1: VIEW_W, top: underStack, fades: fades(underStack) }];
+  if (stack) {
+    const edge = Math.min(screen.x - S.label * 0.6, face ? face.x : Infinity) - S.label;
+    zones.unshift({ x1: edge, top: underRows, fades: fades(underRows) });
+  }
   return {
     forRouting: routing, left, right, cables, byRk: new Map(cables.map((c) => [c.rk, c])),
-    screen, face, stub, pipe, zoneTop, fades: { [VIEW_COLORS.keyboard]: fade(VIEW_COLORS.keyboard), [VIEW_COLORS.input]: fade(VIEW_COLORS.input) },
+    screen, face, stub, pipe, zones,
   };
 }
 
@@ -2411,7 +2477,7 @@ function buildViewLayout(g, S, top, keyBandTop) {
 // parameter's number in the synth's reply. Levers are the slot's top-left, the top label or wave icon,
 // the bottom label, whether it's up and the panel switch's number.
 const PRO800 = {
-  w: 1348, h: 550, plate: '#111214', silk: '#f1f1ec', frame: '#deded8', red: '#ff4a36',
+  w: 1348, h: 550, plate: '#17171b', silk: '#f1f1ec', frame: '#deded8', red: '#ff4a36',
   sections: [
     [17, 21, 666, 88.5, 'Oscillator A'], [17, 124.5, 666, 126.6, 'Oscillator B'], [17, 266.1, 550.8, 129.6, 'Poly-mod'],
     [579.8, 266.1, 103.3, 129.6, ''], [17, 410.7, 550.8, 124, 'LFO-mod'], [579.8, 410.7, 103.3, 124, ''],
@@ -2443,16 +2509,18 @@ const PRO800 = {
   port: /pro.?8000?/i,
   values: null,     // the knobs, 0-1, as last read from the synth
   switches: null,   // the panel switches, as last read
+  rev: 0,           // bumped by each reading, so the painted plate knows it's stale
   waiters: [],
   reread: 0,
+  cache: { key: '', canvas: null },
 };
 
 // The synth's own settings, read once over SysEx with the editor's read-only requests (`0x53 layer`
 // for every knob, `0x4C` for the switches), so the plate shows the sound it's set to. Not kept live:
 // asked again when a video starts and after a program change reaches the synth. Needs SysEx on.
 function pro800Ports() {
-  const out = [...dests.values()].find((d) => d.kind === 'out' && PRO800.port.test(d.name));
-  const inp = [...sources.values()].find((s) => s.kind === 'in' && PRO800.port.test(s.name));
+  const out = [...dests.values()].find((d) => d.kind === 'out' && PRO800.port.test(d.name) && d.port.state === 'connected');
+  const inp = [...sources.values()].find((s) => s.kind === 'in' && PRO800.port.test(s.name) && s.port.state === 'connected');
   return out && inp ? out : null;
 }
 
@@ -2486,15 +2554,24 @@ function onPro800Sysex(data) {
   w.resolve(d);
 }
 
-async function readPro800() {
-  if (!access || !access.sysexEnabled || PRO800.waiters.length) return;
+// True when the synth could be asked; the answer arrives later.
+function readPro800() {
+  if (!access || !access.sysexEnabled) return false;
   const out = pro800Ports();
-  if (!out) return;
+  if (!out) return false;
+  if (!PRO800.waiters.length) askPro800(out);
+  return true;
+}
+
+async function askPro800(out) {
   const p = await pro800Ask(out, [0x53, 0]);
   const b = await pro800Ask(out, [0x4C]);
   if (p) PRO800.values = Array.from({ length: p[2] }, (_, i) => (p[3 + 2 * i] << 7 | p[4 + 2 * i]) / 16383);
   if (b) PRO800.switches = b.slice(1);
-  if (p || b) schedulePanel();
+  if (p || b) {
+    PRO800.rev++;
+    schedulePanel();
+  }
 }
 
 // A program change takes a moment to load.
@@ -2503,11 +2580,27 @@ function pro800Changed() {
   PRO800.reread = setTimeout(readPro800, 400);
 }
 
-// Draws the plate w wide at (x, y). Text that would come out smaller than 4.5 px is left off, and the
-// section names are kept readable, so the plate still reads as the synth at a thumbnail's size.
+// Draws the plate w wide at (x, y). It only changes with a reading or a size, so it's painted
+// into a canvas of its own at the device's resolution and blitted from there each frame.
 function drawPro800(g, x, y, w) {
-  const D = PRO800, k = w / D.w;
-  const fits = (px) => px * k >= 4.5;
+  const D = PRO800, px = g.getTransform().a || 1;
+  const pw = Math.round(w * px), key = `${pw}|${D.rev}`;
+  if (D.cache.key !== key) {
+    const c = D.cache.canvas || (D.cache.canvas = document.createElement('canvas'));
+    c.width = pw;
+    c.height = Math.round(pw * D.h / D.w);
+    paintPro800(c.getContext('2d'), pw, w / D.w);
+    D.cache.key = key;
+  }
+  g.drawImage(D.cache.canvas, x, y, w, w * D.h / D.w);
+}
+
+// Paints the plate w wide at the origin. `detail` is its scale in CSS pixels: small, it's drawn
+// plainly, with no scales, traces or small print, and the section names kept readable, so it
+// still reads as the synth rather than as noise.
+function paintPro800(g, w, detail) {
+  const D = PRO800, k = w / D.w, fine = detail >= 0.6;
+  const fits = (size) => fine && size * detail >= 4.5;
   const font = (px, weight = 800) => { g.font = `${weight} ${px}px system-ui, sans-serif`; };
   const text = (s, tx, ty, px, color, align = 'center', spacing = 0.04) => {
     font(px);
@@ -2518,7 +2611,6 @@ function drawPro800(g, x, y, w) {
     try { g.letterSpacing = '0px'; } catch {}
   };
   g.save();
-  g.translate(x, y);
   g.scale(k, k);
   g.lineJoin = 'round';
   g.textBaseline = 'alphabetic';
@@ -2526,13 +2618,8 @@ function drawPro800(g, x, y, w) {
   g.beginPath();
   g.roundRect(0, 0, D.w, D.h, 12);
   g.fill();
-  g.strokeStyle = '#000';
-  g.lineWidth = 1;
-  g.stroke();
-  g.strokeStyle = '#0b0b0c';
-  g.lineWidth = 6;
-  g.beginPath();
-  g.roundRect(3, 3, D.w - 6, D.h - 6, 9);
+  g.strokeStyle = VIEW_COLORS.edge;
+  g.lineWidth = 1.5 / k;
   g.stroke();
 
   for (const [sx, sy, sw, sh, title] of D.sections) {
@@ -2542,12 +2629,12 @@ function drawPro800(g, x, y, w) {
     g.roundRect(sx, sy, sw, sh, 9);
     g.stroke();
     if (!title) continue;
-    const px = Math.max(11.5, 7 / k);
-    font(px);
+    const size = Math.max(11.5, 7 / detail);
+    font(size);
     const tw = g.measureText(title.toUpperCase()).width * 1.07 + 16;
     g.fillStyle = D.plate;
-    g.fillRect(sx + sw / 2 - tw / 2, sy - px * 0.6, tw, px * 1.2);
-    text(title, sx + sw / 2, sy + px * 0.36, px, D.silk, 'center', 0.07);
+    g.fillRect(sx + sw / 2 - tw / 2, sy - size * 0.6, tw, size * 1.2);
+    text(title, sx + sw / 2, sy + size * 0.36, size, D.silk, 'center', 0.07);
   }
   for (const [vx, vy, vw, vh, kind] of D.viz) {
     g.fillStyle = '#131315';
@@ -2557,6 +2644,7 @@ function drawPro800(g, x, y, w) {
     g.strokeStyle = '#1e1e21';
     g.lineWidth = 1;
     g.stroke();
+    if (!fine) continue;
     g.strokeStyle = D.red;
     g.globalAlpha = 0.55;
     g.lineWidth = 1.5;
@@ -2608,16 +2696,18 @@ function drawPro800(g, x, y, w) {
     const value = V && param >= 0 && V[param] !== undefined ? V[param] : init;
     const cx = kx + 32, cy = ky + 28, amber = flags.includes('a'), bi = flags.includes('b'), sel = flags.includes('s');
     const n = sel ? D.lfoShapes.length : 11;
-    g.strokeStyle = D.silk;
-    g.lineWidth = 0.8;
-    g.beginPath();
-    for (let i = 0; i < n; i++) {
-      const a = -135 + i * 270 / (n - 1), major = sel || i % 2 === 0 || (bi && i === 5);
-      const [x0, y0] = at(cx, cy, a, 16.4), [x1, y1] = at(cx, cy, a, major ? 20 : 18.4);
-      g.moveTo(x0, y0);
-      g.lineTo(x1, y1);
+    if (fine) {
+      g.strokeStyle = D.silk;
+      g.lineWidth = 0.8;
+      g.beginPath();
+      for (let i = 0; i < n; i++) {
+        const a = -135 + i * 270 / (n - 1), major = sel || i % 2 === 0 || (bi && i === 5);
+        const [x0, y0] = at(cx, cy, a, 16.4), [x1, y1] = at(cx, cy, a, major ? 20 : 18.4);
+        g.moveTo(x0, y0);
+        g.lineTo(x1, y1);
+      }
+      g.stroke();
     }
-    g.stroke();
     if (fits(sel ? 5 : 5.6)) {
       for (let i = 0; i < n; i++) {
         const s = sel ? D.lfoShapes[i] : bi ? { 0: '−5', 5: '0', 10: '+5' }[i] : i % 2 ? null : String(i);
@@ -2633,9 +2723,9 @@ function drawPro800(g, x, y, w) {
     g.arc(cx, cy, 13.6, 0, 2 * Math.PI);
     g.fillStyle = amber ? '#3a2606' : '#070708';
     g.fill();
-    g.setLineDash([1.04, 1]);
-    g.strokeStyle = amber ? '#e39a1c' : '#35353a';
-    g.lineWidth = 2.4;
+    if (fine) g.setLineDash([1.04, 1]);
+    g.strokeStyle = amber ? '#e39a1c' : '#3a3a41';
+    g.lineWidth = fine ? 2.4 : 2;
     g.stroke();
     g.setLineDash([]);
     const cap = g.createRadialGradient(cx - 1.7, cy - 3.3, 0, cx - 1.7, cy - 3.3, 14.5);
@@ -2726,28 +2816,58 @@ function chainLook(chain) {
 // synth would come out narrower than the screen, the screen gives way a step.
 function layoutViewStack(S, y, limit, look) {
   if (!move.frame) return null;
-  const captionH = S.tag * 1.4 + 10, drop = S.label * 3.4;
+  // Beside the stack the trails rise to the rows, so under it a shorter rise will do.
+  const rise = S.rise * 0.6;
+  const captionH = S.tag * 1.4 + S.label * 0.6 + 10, drop = S.label * 3.4;
   for (let s = S.screen; s >= 2; s--) {
     const w = 128 * s, h = 64 * s, x = VIEW_W - VIEW_M - w;
     if (look) {
-      const fw = Math.min(VIEW_W - 2 * VIEW_M, (limit - S.rise - (y + drop + h + captionH)) * look.ratio);
+      const fw = Math.min(VIEW_W - 2 * VIEW_M, (limit - rise - (y + drop + h + captionH)) * look.ratio);
       if (fw < w * 1.1) continue;
       const face = { x: VIEW_W - VIEW_M - fw, y, w: fw, h: fw / look.ratio, look };
       const screen = { x, y: y + face.h + drop, w, h };
       return { face, screen, bottom: screen.y + h + captionH };
     }
-    if (limit - (y + h + captionH) >= S.rise) return { face: null, screen: { x, y, w, h }, bottom: y + h + captionH };
+    if (limit - (y + h + captionH) >= rise) return { face: null, screen: { x, y, w, h }, bottom: y + h + captionH };
   }
   return look ? layoutViewStack(S, y, limit, null) : null;
 }
 
-// The audio cable, from the port the MIDI goes to down to the top of the screen.
-function pipeTo(S, from, screen, midi) {
+// A cable from a point down to the top of a box; pad stops it at the box's bezel.
+function pipeTo(S, from, box, midi, pad = 0) {
   return {
     x: from.x, y: from.y,
-    toX: Math.min(screen.x + screen.w - S.label, Math.max(screen.x + S.label, from.x)), toY: screen.y,
+    toX: Math.min(box.x + box.w - S.label, Math.max(box.x + S.label, from.x)), toY: box.y - pad,
     midi,
   };
+}
+
+// A label sitting on a cable.
+function drawPill(g, S, text, x, y, color) {
+  g.font = `500 ${S.tag}px system-ui, sans-serif`;
+  const w = g.measureText(text).width + S.tag * 1.2, h = S.tag * 1.6;
+  g.fillStyle = VIEW_COLORS.bg;
+  g.beginPath();
+  g.roundRect(x - w / 2, y - h / 2, w, h, h / 2);
+  g.fill();
+  g.strokeStyle = VIEW_COLORS.idle;
+  g.lineWidth = 1;
+  g.stroke();
+  g.fillStyle = color;
+  g.textAlign = 'center';
+  g.textBaseline = 'middle';
+  g.fillText(text, x, y + S.tag * 0.05);
+  g.textAlign = 'left';
+  g.textBaseline = 'alphabetic';
+}
+
+// The cables' names, drawn last so they sit on top.
+function drawViewPills(g, S, L) {
+  const P = L.pipe;
+  if (!P) return;
+  drawPill(g, S, 'audio', (P.x + P.toX) / 2, (P.y + P.toY) / 2, VIEW_COLORS.audio);
+  const c = P.midi;
+  if (c) drawPill(g, S, 'MIDI', cubic(c.a.x, c.c1x, c.c2x, c.b.x, 0.5), (c.a.y + c.b.y) / 2, VIEW_COLORS.input);
 }
 
 function drawViewScreen(g, S, L, now) {
@@ -2795,27 +2915,25 @@ function drawViewScreen(g, S, L, now) {
       // Dots run down the cable for as long as there's sound.
       g.fillStyle = '#ffffff';
       for (let i = 0; i < 3; i++) {
-        const t = (now / 900 + i / 3) % 1, u = 1 - t;
-        const x = u * u * u * P.x + 3 * u * u * t * P.x + 3 * u * t * t * P.toX + t * t * t * P.toX;
-        const y = u * u * u * P.y + 3 * u * u * t * (P.y + bend) + 3 * u * t * t * (P.toY - bend) + t * t * t * P.toY;
+        const t = (now / 900 + i / 3) % 1;
+        const x = cubic(P.x, P.x, P.toX, P.toX, t);
+        const y = cubic(P.y, P.y + bend, P.toY - bend, P.toY, t);
         g.beginPath();
         g.arc(x, y, S.label * 0.18, 0, 2 * Math.PI);
         g.fill();
       }
       g.globalAlpha = 1;
     }
-    g.font = `500 ${S.tag}px system-ui, sans-serif`;
-    g.textBaseline = 'middle';
-    g.textAlign = 'right';
-    g.fillStyle = VIEW_COLORS.audio;
-    g.fillText('audio', Math.min(P.x, P.toX) - S.label * 0.6, P.y + bend);
-    if (P.midi) {
-      g.textAlign = 'center';
-      g.fillStyle = VIEW_COLORS.input;
-      g.fillText('MIDI', (P.midi.a.x + P.midi.b.x) / 2, (P.midi.a.y + P.midi.b.y) / 2 - S.label * 0.7);
-    }
-    g.textAlign = 'left';
   }
+  // The screen in a bezel, like the synth's plate.
+  const pad = S.label * 0.6;
+  g.fillStyle = VIEW_COLORS.bezel;
+  g.beginPath();
+  g.roundRect(B.x - pad, B.y - pad, B.w + 2 * pad, B.h + 2 * pad, S.label * 0.4);
+  g.fill();
+  g.strokeStyle = VIEW_COLORS.edge;
+  g.lineWidth = 1.5;
+  g.stroke();
   g.fillStyle = '#000000';
   g.fillRect(B.x, B.y, B.w, B.h);
   g.imageSmoothingEnabled = false;
@@ -2830,7 +2948,7 @@ function drawViewScreen(g, S, L, now) {
   g.font = `500 ${S.tag}px system-ui, sans-serif`;
   g.textBaseline = 'alphabetic';
   g.fillStyle = VIEW_COLORS.muted;
-  g.fillText(move.lineIn ? 'Move · Line In on slot 2' : 'Move', B.x, B.y + B.h + S.tag * 1.4);
+  g.fillText(move.lineIn ? 'Move · Line In on slot 2' : 'Move', B.x, B.y + B.h + pad + S.tag * 1.4);
 }
 
 function drawViewCables(g, S, L, now) {
@@ -2858,9 +2976,9 @@ function drawViewCables(g, S, L, now) {
   for (const p of view.pulses) {
     const c = L.byRk.get(p.rk);
     if (!c) continue;
-    const t = (now - p.at) / 500, u = 1 - t;
-    const x = u * u * u * c.a.x + 3 * u * u * t * c.c1x + 3 * u * t * t * c.c2x + t * t * t * c.b.x;
-    const y = u * u * u * c.a.y + 3 * u * u * t * c.a.y + 3 * u * t * t * c.b.y + t * t * t * c.b.y;
+    const t = (now - p.at) / 500;
+    const x = cubic(c.a.x, c.c1x, c.c2x, c.b.x, t);
+    const y = cubic(c.a.y, c.a.y, c.b.y, c.b.y, t);
     g.fillStyle = '#ffffff';
     g.beginPath();
     g.arc(x, y, S.label * 0.2, 0, 2 * Math.PI);
@@ -2922,10 +3040,11 @@ function buildPanelLayout(g, S, W, dpr) {
   const look = chainLook(chain);
   const face = look ? { x: PANEL_M, y: snap(y), w: width - 2 * PANEL_M, h: (width - 2 * PANEL_M) / look.ratio, look } : null;
   if (face) y = face.y + face.h + S.label * 3.4;
-  const screen = { x: snap(width - PANEL_M - w), y: snap(y), w, h };
-  screen.bottom = screen.y + h + S.tag * 1.4 + 4;
+  const pad = S.label * 0.6;
+  const screen = { x: snap(width - PANEL_M - w), y: snap(y + (chain ? 0 : pad)), w, h };
+  screen.bottom = screen.y + h + pad + S.tag * 1.4 + 4;
   const stub = face ? pipeTo(S, right.get(chain.dst), face, cables[0]) : null;
-  const pipe = chain ? pipeTo(S, face ? { x: stub.toX, y: face.y + face.h } : right.get(chain.dst), screen, cables[0]) : null;
+  const pipe = chain ? pipeTo(S, face ? { x: stub.toX, y: face.y + face.h } : right.get(chain.dst), screen, cables[0], pad) : null;
   return { forRouting: routing, left, right, cables, byRk: new Map(cables.map((c) => [c.rk, c])), screen, face, stub, pipe, width, height: screen.bottom + PANEL_M };
 }
 
@@ -2955,9 +3074,15 @@ function drawPanel() {
   const now = performance.now();
   g.setTransform(dpr, 0, 0, dpr, 0, 0);
   g.clearRect(0, 0, L.width, L.height);
+  // On the video's own ground, so it looks the same in either theme.
+  g.fillStyle = VIEW_COLORS.bg;
+  g.beginPath();
+  g.roundRect(0, 0, L.width, L.height, 10);
+  g.fill();
   drawViewScreen(g, PANEL_SHAPE, L, now);
   if (L.cables.length) drawViewCables(g, PANEL_SHAPE, L, now);
   else view.pulses = view.pulses.filter((p) => now - p.at < 500);
+  drawViewPills(g, PANEL_SHAPE, L);
   // It keeps going while there's something moving.
   const level = L.pipe ? Math.max(rec.shown[0], rec.shown[1]) : 0;
   const lit = [...view.active.values()].some((t) => now - t < 250);
@@ -3003,14 +3128,17 @@ function updateViewTrails(now) {
 }
 
 function drawViewTrails(g, S, L, keyTop, now) {
-  const height = keyTop - L.zoneTop;
-  view.trails = view.trails.filter((t) => !t.end || (now - t.end) / 1000 * S.rise < height);
+  const zoneOf = (key) => L.zones.find((z) => key.x + key.w / 2 < z.x1) || L.zones[L.zones.length - 1];
+  // A trail is done once it has risen out of its own zone.
+  view.trails = view.trails.filter((t) => !t.end || (now - t.end) / 1000 * S.rise < keyTop - zoneOf(viewKeys.get(t.n)).top);
   for (const t of view.trails) {
     const key = viewKeys.get(t.n);
+    const zone = zoneOf(key);
     const bottom = keyTop - (t.end ? (now - t.end) / 1000 * S.rise : 0);
-    const top = Math.max(L.zoneTop, Math.min(keyTop - (now - t.start) / 1000 * S.rise, bottom - 6));
+    const top = Math.max(zone.top, Math.min(keyTop - (now - t.start) / 1000 * S.rise, bottom - 6));
+    if (bottom <= top) continue;
     const w = key.black ? key.w : key.w * 0.72;
-    g.fillStyle = L.fades[t.color];
+    g.fillStyle = zone.fades[t.color];
     g.beginPath();
     g.roundRect(key.x + (key.w - w) / 2, top, w, bottom - top, Math.min(w / 2, 4));
     g.fill();
@@ -3069,6 +3197,7 @@ function drawView() {
   drawViewTrails(g, S, L, keyTop, now);
   drawViewScreen(g, S, L, now);
   drawViewCables(g, S, L, now);
+  drawViewPills(g, S, L);
   drawViewKeys(g, keyTop);
 }
 
@@ -3368,9 +3497,9 @@ async function openMoveStream() {
     }
   } catch {
     if (c.signal.aborted) return;
-    let access = '';
-    try { access = (await navigator.permissions.query({ name: 'local-network-access' })).state; } catch {}
-    setMoveState({ blocked: access === 'denied' });
+    let perm = '';
+    try { perm = (await navigator.permissions.query({ name: 'local-network-access' })).state; } catch {}
+    setMoveState({ blocked: perm === 'denied' });
   }
   if (move.stream !== c) return;
   move.live = false;
