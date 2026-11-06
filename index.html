@@ -174,6 +174,12 @@ main {
 .matrix td { padding: 0; width: 40px; height: 40px; text-align: center; }
 .matrix tr:hover th, .matrix th.hl { color: var(--accent); }
 .kind { font-size: 11px; color: var(--muted); font-weight: 400; }
+.swatch {
+  width: 14px; height: 14px; padding: 0; border: 1px solid var(--line); border-radius: 50%;
+  background: none; cursor: pointer; flex: none;
+}
+.swatch::-webkit-color-swatch-wrapper { padding: 0; }
+.swatch::-webkit-color-swatch { border: none; border-radius: 50%; }
 .cell {
   width: 32px; height: 32px; padding: 0; border-radius: 8px;
   border: 1px dashed var(--line); background: transparent; cursor: pointer;
@@ -326,7 +332,7 @@ input[type="range"] { accent-color: var(--accent); }
   background: var(--key-black); border-radius: 0 0 5px 5px;
   box-shadow: inset 0 -5px 0 rgb(255 255 255 / .08), 0 2px 3px rgb(0 0 0 / .25);
 }
-.key.in.white { background: var(--in-soft); }
+.key.in.white { background: color-mix(in srgb, var(--in) 32%, var(--key-white)); }
 .key.in.black { background: var(--in); }
 .key.down.white, .key.down.black { background: var(--accent); }
 .key.off { opacity: .35; pointer-events: none; }
@@ -584,11 +590,13 @@ function loadKnobs(saved) {
 }
 
 function loadState() {
-  const base = { routes: {}, kb: { ch: 1, oct: 3, vel: 100 }, sysex: false, recSource: '', recFormat: 'mp3', recNorm: false, recShape: 'square', routesOpen: false, knobs: defaultKnobs() };
+  const base = { routes: {}, kb: { ch: 1, oct: 3, vel: 100 }, sysex: false, recSource: '', recFormat: 'mp3', recNorm: false, recShape: 'square', routesOpen: false, knobs: defaultKnobs(), colors: {} };
   try {
     const s = JSON.parse(localStorage.getItem(STORE));
     if (s && typeof s === 'object') {
-      return { routes: s.routes || {}, kb: { ...base.kb, ...s.kb }, sysex: !!s.sysex, recSource: String(s.recSource || ''), recFormat: s.recFormat === 'wav' ? 'wav' : 'mp3', recNorm: !!s.recNorm, recShape: s.recShape === 'vertical' ? 'vertical' : 'square', routesOpen: !!s.routesOpen, knobs: loadKnobs(s.knobs) };
+      const colors = {};
+      for (const [k, v] of Object.entries(s.colors || {})) if (/^#[0-9a-f]{6}$/i.test(v)) colors[k] = v.toLowerCase();
+      return { routes: s.routes || {}, kb: { ...base.kb, ...s.kb }, sysex: !!s.sysex, recSource: String(s.recSource || ''), recFormat: s.recFormat === 'wav' ? 'wav' : 'mp3', recNorm: !!s.recNorm, recShape: s.recShape === 'vertical' ? 'vertical' : 'square', routesOpen: !!s.routesOpen, knobs: loadKnobs(s.knobs), colors };
     }
   } catch {}
   return base;
@@ -1009,7 +1017,7 @@ function onInput(key, data) {
   if (!s) return;   // the port went away and this is its last word
   const st = data[0];
   const type = st & 0xF0;
-  if (type === 0x90 || type === 0x80) markIncoming(data[1], type === 0x90 && data[2] > 0);
+  if (type === 0x90 || type === 0x80) markIncoming(key, data[1], type === 0x90 && data[2] > 0);
   else if (st === 0xF0 && PRO800.port.test(s.name)) onPro800Sysex(data);
   dispatch(key, data);
 }
@@ -1029,7 +1037,7 @@ function panic() {
     }
   }
   inNotes.clear();
-  for (const el of keyEls.values()) el.classList.remove('in', 'down');
+  for (const el of keyEls.values()) { el.classList.remove('in', 'down'); el.style.setProperty('--in', ''); }
   setSustain(false, false);
   toast('All notes off sent to every output.');
 }
@@ -1071,6 +1079,26 @@ function loopRisk(src, dst) {
   return s && d && s.kind === 'in' && d.kind === 'out' && s.name === d.name;
 }
 
+/* ---------- device colours ---------- */
+
+// Each input's notes have a colour of their own, on the keyboard and in the video: picked from the
+// palette by the port's place among the inputs, or as set on its row, by port name.
+const INPUT_PALETTE = ['#7c95ff', '#51cf8a', '#e64980', '#f5c518', '#22b8cf', '#be4bdb', '#ff922b', '#94d82d'];
+function sourceColor(s) {
+  if (s.kind === 'kb') return VIEW_COLORS.keyboard;
+  const set = state.colors[s.name];
+  if (set) return set;
+  const ins = [...sources.values()].filter((x) => x.kind === 'in');
+  return INPUT_PALETTE[Math.max(0, ins.indexOf(s)) % INPUT_PALETTE.length];
+}
+function setSourceColor(name, color) {
+  state.colors[name] = color;
+  save();
+  for (const [n, held] of inNotes) paintIncoming(n, held);
+  view.layout = panel.layout = null;
+  schedulePanel();
+}
+
 function renderMatrix() {
   const t = $('#matrix');
   let h = '<thead><tr><th class="corner">from ↓ &nbsp; to →</th>';
@@ -1079,7 +1107,8 @@ function renderMatrix() {
   }
   h += '</tr></thead><tbody>';
   for (const s of sources.values()) {
-    h += `<tr><th title="${esc(s.name)}"><span class="rname"><span class="led" data-led="${esc('s:' + s.key)}"></span>${esc(s.name)}${s.kind === 'kb' ? ' <span class="kind">(virtual)</span>' : ''}</span></th>`;
+    const swatch = s.kind === 'in' ? `<input type="color" class="swatch" value="${sourceColor(s)}" data-name="${esc(s.name)}" title="Colour of this input's notes" aria-label="Colour of ${esc(s.name)}'s notes">` : '';
+    h += `<tr><th title="${esc(s.name)}"><span class="rname"><span class="led" data-led="${esc('s:' + s.key)}"></span>${esc(s.name)}${s.kind === 'kb' ? ' <span class="kind">(virtual)</span>' : ''}${swatch}</span></th>`;
     for (const d of dests.values()) {
       const { on, maps } = getRoute(s.key, d.key);
       const risk = loopRisk(s.key, d.key);
@@ -1098,6 +1127,10 @@ function renderMatrix() {
   }
 }
 
+$('#matrix').addEventListener('input', (e) => {
+  const sw = e.target.closest('.swatch');
+  if (sw) setSourceColor(sw.dataset.name, sw.value);
+});
 $('#matrix').addEventListener('click', (e) => {
   const b = e.target.closest('.cell');
   if (!b) return;
@@ -1385,7 +1418,7 @@ $('#mon-clear').addEventListener('click', () => {
 const keysEl = $('#keys');
 const keyEls = new Map();      // note -> element
 const kbHeld = new Map();      // note -> {count, ch}
-const inNotes = new Map();     // note -> count of notes held on inputs
+const inNotes = new Map();     // note -> Map(source key -> count) of notes held on inputs
 const pressedCodes = new Map(); // KeyboardEvent.code -> note
 const pointerNotes = new Map(); // pointerId -> note
 const KEYMAP = {
@@ -1429,9 +1462,9 @@ function buildKeys() {
     const name = n % 12 === 0 ? noteName(n) : '';
     if (ck || name) el.innerHTML = `<span class="lab">${ck ? `<span class="ck">${esc(ck)}</span>` : ''}${name}</span>`;
     if (kbHeld.has(n)) el.classList.add('down');
-    if (inNotes.get(n)) el.classList.add('in');
     keysEl.appendChild(el);
     keyEls.set(n, el);
+    if (inNotes.has(n)) paintIncoming(n, inNotes.get(n));
   }
   $('#oct').textContent = noteName(base);
 }
@@ -1461,10 +1494,21 @@ function forceKbOff(n) {
   sendKb([0x80 | h.ch, n, 0]);
 }
 
-function markIncoming(n, on) {
-  const c = (inNotes.get(n) || 0) + (on ? 1 : -1);
-  if (c > 0) inNotes.set(n, c); else inNotes.delete(n);
-  keyEls.get(n)?.classList.toggle('in', c > 0);
+function markIncoming(src, n, on) {
+  let held = inNotes.get(n);
+  if (!held) { if (!on) return; held = new Map(); inNotes.set(n, held); }
+  const c = (held.get(src) || 0) + (on ? 1 : -1);
+  if (c > 0) held.set(src, c); else held.delete(src);
+  if (!held.size) inNotes.delete(n);
+  paintIncoming(n, held);
+}
+// The key takes the colour of the input that held the note first.
+function paintIncoming(n, held) {
+  const el = keyEls.get(n);
+  if (!el) return;
+  const s = held.size ? sources.get(held.keys().next().value) : null;
+  el.classList.toggle('in', !!s);
+  el.style.setProperty('--in', s ? sourceColor(s) : '');
 }
 
 function noteAt(x, y) {
@@ -2382,7 +2426,7 @@ function viewNames(ports) {
   return out;
 }
 
-const viewColor = (s) => (s.kind === 'kb' ? VIEW_COLORS.keyboard : VIEW_COLORS.input);
+const viewColor = sourceColor;
 
 // A point along a cubic bezier, one axis at a time.
 function cubic(p0, p1, p2, p3, t) {
@@ -2455,14 +2499,19 @@ function buildViewLayout(g, S, top, keyBandTop) {
     const plug = right.get(chain.dst);
     pipe = pipeTo(S, face ? { x: plug.x, y: face.y + face.h } : plug, screen, cables.find((c) => c.rk === chain.rk), S.label * 0.6);
   }
+  // A fade per colour, made as each colour's first trail needs it.
   const fades = (zTop) => {
-    const fade = (color) => {
-      const grad = g.createLinearGradient(0, zTop, 0, keyBandTop);
-      grad.addColorStop(0, color + '00');
-      grad.addColorStop(0.55, color + 'e6');
+    const made = new Map();
+    return (color) => {
+      let grad = made.get(color);
+      if (!grad) {
+        grad = g.createLinearGradient(0, zTop, 0, keyBandTop);
+        grad.addColorStop(0, color + '00');
+        grad.addColorStop(0.55, color + 'e6');
+        made.set(color, grad);
+      }
       return grad;
     };
-    return { [VIEW_COLORS.keyboard]: fade(VIEW_COLORS.keyboard), [VIEW_COLORS.input]: fade(VIEW_COLORS.input) };
   };
   // The trails rise to the rows, except under the screen and the synth, where they stop below them.
   const underRows = top + height + (rows ? 16 : 0);
@@ -3166,20 +3215,33 @@ const viewKeys = (() => {
 
 // Trails follow what's sounding, read from the same state that lights the keys.
 function updateViewTrails(now) {
-  for (let n = VIEW_LO; n <= VIEW_HI; n++) {
-    for (const [color, sounding] of [[VIEW_COLORS.keyboard, kbHeld.has(n)], [VIEW_COLORS.input, !!inNotes.get(n)]]) {
-      const id = color + n;
-      const trail = view.open.get(id);
-      if (sounding && !trail) {
-        const t = { n, color, start: now, end: 0 };
-        view.trails.push(t);
-        view.open.set(id, t);
-      } else if (!sounding && trail) {
-        trail.end = now;
-        view.open.delete(id);
-      }
+  // What sounds now, as trail ids: the keyboard's notes and each input's, in their colours.
+  const sounding = new Map();
+  for (const n of kbHeld.keys()) sounding.set(KB + n, { n, color: VIEW_COLORS.keyboard });
+  for (const [n, held] of inNotes) {
+    for (const src of held.keys()) {
+      const s = sources.get(src);
+      if (s) sounding.set(src + n, { n, color: sourceColor(s) });
     }
   }
+  for (const [id, { n, color }] of sounding) {
+    if (view.open.has(id) || n < VIEW_LO || n > VIEW_HI) continue;
+    const t = { n, color, start: now, end: 0 };
+    view.trails.push(t);
+    view.open.set(id, t);
+  }
+  for (const [id, trail] of view.open) {
+    if (sounding.has(id)) continue;
+    trail.end = now;
+    view.open.delete(id);
+  }
+}
+// The colour a key shows: the keyboard's own note, else the input that held it first.
+function noteColor(n) {
+  if (kbHeld.has(n)) return VIEW_COLORS.keyboard;
+  const held = inNotes.get(n);
+  const s = held && sources.get(held.keys().next().value);
+  return s ? sourceColor(s) : null;
 }
 
 function drawViewTrails(g, S, L, keyTop, now) {
@@ -3193,7 +3255,7 @@ function drawViewTrails(g, S, L, keyTop, now) {
     const top = Math.max(zone.top, Math.min(keyTop - (now - t.start) / 1000 * S.rise, bottom - 6));
     if (bottom <= top) continue;
     const w = key.black ? key.w : key.w * 0.72;
-    g.fillStyle = zone.fades[t.color];
+    g.fillStyle = zone.fades(t.color);
     g.beginPath();
     g.roundRect(key.x + (key.w - w) / 2, top, w, bottom - top, Math.min(w / 2, 4));
     g.fill();
@@ -3201,11 +3263,10 @@ function drawViewTrails(g, S, L, keyTop, now) {
 }
 
 function drawViewKeys(g, keyTop) {
-  const lit = (n) => (kbHeld.has(n) ? VIEW_COLORS.keyboard : inNotes.get(n) ? VIEW_COLORS.input : null);
   for (const black of [false, true]) {
     for (const [n, k] of viewKeys) {
       if (k.black !== black) continue;
-      g.fillStyle = lit(n) || (black ? '#141417' : '#d9d5cc');
+      g.fillStyle = noteColor(n) || (black ? '#141417' : '#d9d5cc');
       g.beginPath();
       g.roundRect(k.x, keyTop, k.w, black ? VIEW_KEY_H * 0.62 : VIEW_KEY_H, [0, 0, 3, 3]);
       g.fill();
